@@ -1,4 +1,4 @@
-package projectname
+package surov3
 
 import spinal.core._
 import spinal.core.sim._
