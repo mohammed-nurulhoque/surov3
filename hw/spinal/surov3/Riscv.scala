@@ -30,6 +30,7 @@ object rv {
   def arith  (ir: Bits): Bool = ((opcode(ir) === Opcode.Op 
                                  | (opcode(ir) === Opcode.OpImm & (funct3(ir) === F3_SLL | funct3(ir) === F3_SR))) 
                                 & ir(30))
+  def nop: Bits = Opcode.OpImm.asBits.resize(32)
   def shadd  (ir: Bits): Bool = opcode(ir) === Opcode.Op & ir(29)
   def imm_i  (ir: Bits): SInt = ir(31 downto 20).asSInt.resize(32) // Sign extended to 32 bits
   def imm_s  (ir: Bits): SInt = (ir(31 downto 25) ## ir(11 downto 7)).asSInt.resize(32) // Concatenate [31:25] and [11:7], then sign extend

@@ -8,9 +8,17 @@ SuroV3 introduces a thin abstraction layer for the instruction definitions (Chec
 
 ## Current Status
 
+### commit 24fee6e5
+
 **ISA Compliance**: Passes a large portion of the riscv-isa-tests. (didn't fail any. I just haven't run them in bulk yet).
 
 **Parameters**: Currently supports the enableDualPort parameter for the Register File.
+
+### commit b4f480e2
+
+Multi-issue kinda working without load/store
+    
+passed riscv-test addi at one point with 4-wide pipeline, at nearly 1 IPC
 
 ## Building and Simulation
 
