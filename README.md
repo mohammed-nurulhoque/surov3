@@ -8,17 +8,17 @@ SuroV3 introduces a thin abstraction layer for the instruction definitions (Chec
 
 ## Current Status
 
-### commit 24fee6e5
+**Parameters**: Currently supports enableDualPort and issueWidth
 
-**ISA Compliance**: Passes a large portion of the riscv-isa-tests. (didn't fail any. I just haven't run them in bulk yet).
+Tested 1, 2 & 4 issueWidth and single/dual port
 
-**Parameters**: Currently supports the enableDualPort parameter for the Register File.
 
-### commit b4f480e2
-
-Multi-issue kinda working without load/store
-    
-passed riscv-test addi at one point with 4-wide pipeline, at nearly 1 IPC
+| IssueWidth / Dual-port | kGE | Hoped DMIPS/MHz |
+| ---- | --- | --- |
+| 1/No | 5.5 | 0.6 |
+| 2/No | 10  | 0.8 |
+| 2/Yes | 11 | 0.85 |
+| 3/No | 20  | 0.9 |
 
 ## Building and Simulation
 

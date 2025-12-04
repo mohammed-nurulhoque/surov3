@@ -144,9 +144,20 @@ class JalrImpl(p: Pipeline) extends InstImpl(p) {
 class SysImpl(p: Pipeline) extends InstImpl(p) {
   override def opcode: Opcode.C = Opcode.Sys
   override val KillFollowing = true
-  override def getS2(c: IExContext): Unit = {
-    p.finish(c)
+
+  // This is a hack to flush pipeline by S3
+  val counter = Reg(UInt(2 bits))
+  override def getS1(c: IExContext): Unit = {
+    counter := 3
+    p.nextStage(c)
   }
+
+  override def getS2(c: IExContext): Unit = {
+    counter := counter - 1
+    when (counter === U(0, 2 bits)) (p.nextStage(c))
+  }
+
+  override def getS3(c: IExContext): Unit = p.finish(c)
 }
 
 class FenceImpl(p: Pipeline) extends InstImpl(p) {

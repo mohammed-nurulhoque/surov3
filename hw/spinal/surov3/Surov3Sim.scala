@@ -1,5 +1,6 @@
 package surov3
 
+import java.io._
 import scala.io.Source
 import java.io.FileInputStream
 import java.nio.ByteBuffer
@@ -12,18 +13,23 @@ object Surov3CoreSim extends App {
   val SYS_EXIT  = 93
   val SYS_WRITE = 64
 
-  val maxCycles = 400 // Safety timeout
+  val maxCycles = 1000 // Safety timeout
+  val baseAddr = 0x1000
   val binFiles = if (args.isEmpty) Array("hw/a.bin") else args
   val cfg = SurovConfig()
 
+    val fw = new FileWriter("hw/a.log", false)
+    val pw = new PrintWriter(fw)
+
   Config.sim.withWave.noOptimisation.compile(SimDUT(cfg)).doSim { dut =>
+    val pl = dut.top.core.pipeline
     // --- Load Instructions from program.bin ---
     for (binFilePath <- binFiles) {
       val fis = new FileInputStream(binFilePath)
       val buffer = new Array[Byte](cfg.issueWidth * 4) // Read 4 bytes at a time for 32-bit words
       
       dut.mem.setBigInt(0, 0)
-      var wordsLoaded = 0x1000 / (4 * cfg.issueWidth)
+      var wordsLoaded = baseAddr / (4 * cfg.issueWidth)
       println(s"Loading instructions from $binFilePath...")
       while (fis.read(buffer) != -1) {
         dut.mem.setBigInt(address = wordsLoaded, data = BigInt(0.toByte +: buffer.reverse))
@@ -50,7 +56,7 @@ object Surov3CoreSim extends App {
       // Wait a rising edge on the clock
       dut.clockDomain.waitRisingEdge(6)
       println(f"first word: ${dut.mem.getBigInt(0x100)}%x")
-      assert(!dut.top.core.pipeline.pipes.exists(c => c.stage.toEnum != Stage.S1))
+      assert(!pl.pipes.exists(c => c.stage.toEnum != Stage.S1))
 
       // 4. Main Simulation Loop
       var cycles = 0
@@ -58,22 +64,26 @@ object Surov3CoreSim extends App {
       while(cycles < maxCycles) {
         dut.clockDomain.waitRisingEdge()
         cycles += 1
-        println(f"[cycle ${cycles}%03d Pipes state:")
-        println(s"irLine:    ${dut.top.core.pipeline.irLine.map(_.toLong.toHexString)}")
-        println(s"regReads:  ${dut.top.core.pipeline.regReads.map(_.toLong.toBinaryString)}")
-        println(s"regWrites: ${dut.top.core.pipeline.regWrites.map(_.toLong.toBinaryString)}")
-        // println(s"readScan:  ${dut.top.core.pipeline.readScan.map(_.toLong.toBinaryString)}")
-        // println(s"writeScan: ${dut.top.core.pipeline.writeScan.map(_.toLong.toBinaryString)}")
-        println(s"killCurr:  ${dut.top.core.pipeline.killCur.toLong.toBinaryString}")
-        println(f"kills: ${dut.top.core.pipeline.kill.toLong.toBinaryString}")
-        for (c <- dut.top.core.pipeline.pipes) {
-          println(f"(${c.id}) ${if (c.active.toBoolean) "✓" else "✗"} ${if ((dut.top.core.pipeline.kill.toLong >> c.id & 1) == 0) "✓" else "✗"} ${c.stage.toEnum} pc: ${c.pc.toLong}%08x ir: ${c.ir.toLong}%08x")
+        pw.println(f"[cycle ${cycles}%03d] Pipes state:")
+        pw.println(s"fetchedJump: ${pl.fetchedJump.toBoolean} jumping ${pl.jumping.toBoolean} jumped: ${pl.jumped.toBoolean}")
+        pw.println(s"irLine:    ${pl.irLine.map(_.toLong.toHexString)}")
+        pw.println(s"regReads:  ${pl.regReads.map(_.toLong.toBinaryString)}")
+        pw.println(s"regWrites: ${pl.regWrites.map(_.toLong.toBinaryString)}")
+        // println(s"readScan:  ${pl.readScan.map(_.toLong.toBinaryString)}")
+        // println(s"writeScan: ${pl.writeScan.map(_.toLong.toBinaryString)}")
+        pw.println(s"killCurr:  ${pl.killCur.toLong.toBinaryString}")
+        pw.println(f"kills: ${pl.kill.toLong.toBinaryString}")
+        for (c <- pl.pipes) {
+          pw.println(f"(${c.id}) ${if (c.active.toBoolean) "✓" else "✗"} ${if ((pl.kill.toLong >> c.id & 1) == 0) "✓" else "✗"} ${c.stage.toEnum} pc: ${c.pc.toLong}%08x ir: ${c.ir.toLong}%08x")
         }
-        if (dut.top.core.pipeline.pipes(0).stage.toEnum == Stage.S1)
-          instsRet += 1
+        if (pl.pipes(0).stage.toEnum == Stage.S1) {
+          // println(f"kill ${pl.kill.toInt.toBinaryString} active: ${pl.active.toInt.toBinaryString} (a & ~k): ${(pl.kill.toLong & ~pl.active.toLong).toBinaryString} count: ${java.lang.Long.bitCount(pl.kill.toLong & ~pl.active.toLong)}")
+          instsRet += java.lang.Long.bitCount(~pl.kill.toLong & pl.active.toLong)
+        }
+        pw.println(f"InstsRet after: ${instsRet}")
         val trap = dut.trap.toInt
-        if (trap != 0 & dut.top.core.pipeline.pipes(0).stage.toEnum == Stage.S1) {
-          val c = dut.top.core.pipeline.pipes(Integer.numberOfTrailingZeros(trap))
+        val c = if (trap != 0) pl.pipes(Integer.numberOfTrailingZeros(trap)) else null
+        if (trap != 0 && c.stage.toEnum == Stage.S3) {
           val pc = c.pc.toLong
           val ir = c.ir.toBigInt // The instruction causing the trap
           
@@ -88,9 +98,10 @@ object Surov3CoreSim extends App {
             a5.toLong match {
               case SYS_EXIT =>
                 val exitCode = a0.toLong
-                System.err.println(f"Completed $instsRet instructions in $cycles Cycles")
-                System.err.println(f"EXIT STATUS: $exitCode")
-                
+                pw.println(f"Completed $instsRet instructions in $cycles Cycles")
+                pw.println(f"EXIT STATUS: $exitCode")
+                pw.close()
+                fw.close()
                 simSuccess()
 
               case SYS_WRITE =>
@@ -108,7 +119,9 @@ object Surov3CoreSim extends App {
                 print(sb.toString)
 
               case _ =>
-                System.err.println(f"Unhandled Syscall #$a5 at PC: $pc%08x")
+                pw.println(f"Unhandled Syscall #$a5 at PC: $pc%08x")
+                pw.close()
+                fw.close()
                 simFailure()
             }
           } 
@@ -120,7 +133,9 @@ object Surov3CoreSim extends App {
               case 0xC02 => instsRet
               case _ =>
                 // Default case: Unhandled CSR
-                System.err.println(f"ERROR: Unhandled CSR read at PC: $pc%08x")
+                pw.println(f"ERROR: Unhandled CSR read at PC: $pc%08x")
+                pw.close()
+                fw.close()
                 simFailure() // <-- SIMULATION FAILURE ON UNHANDLED CSR
             }
             dut.top.rf.setBigInt(ir.toLong >> 7 & 0x1F, dataToWrite)
@@ -129,12 +144,15 @@ object Surov3CoreSim extends App {
             // Fence Logic placeholder
           } 
           else {
-            System.err.println(f"Unrecognized TRAP op $ir%08x at PC: $pc%08x")
+            pw.println(f"Unrecognized TRAP op $ir%08x at PC: $pc%08x")
+            pw.close()
+            fw.close()
             simFailure()
           }
         }
       }
-
+      pw.close()
+      fw.close()
       simFailure(s"Didn't finish after $maxCycles steps")
     }
   }

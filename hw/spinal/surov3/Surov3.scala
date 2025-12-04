@@ -6,16 +6,16 @@ import surov3.Utils._
 
 case class SurovConfig(
   regCount: Int = 32,
-  enableDualPort: Boolean = false,
+  enableDualPort: Boolean = true,
   enableZba: Boolean = false,
-  issueWidth: Int = 4,
+  issueWidth: Int = 2,
   enableForward: Boolean = false,
   xlen: Int = 32,
 )
 
 class RFIF(xlen: Int, regCount: Int) extends Bundle {
   val addr = out UInt(log2Up(regCount) bits) assignDontCare
-  val wren = out Bool() assignDontCare
+  val wren = out Bool(false)
   val writeData = out Bits(xlen bits) assignDontCare
   val readData = in Bits(xlen bits)
 
@@ -193,7 +193,6 @@ class IExContext(cfg: SurovConfig, val id: Int,
 
   val rf1 = new RFIF(cfg.xlen, cfg.regCount)
   val rf2 = Option.when(cfg.enableDualPort)(new RFIF(cfg.xlen, cfg.regCount))
-
   alu.f3 := rv.F3_ADDSUB
   List(alu.src_a, alu.src_b, alu.start) map (_.assignDontCare)
   List(alu.arith_bit, alu.shadd, alu.branch) map (_ := False)
@@ -225,10 +224,10 @@ class Pipeline(val cfg: SurovConfig) {
   irLine(0).init(Opcode.Jal.asBits.resize(32) | 0x1000)
   for (i <- 1 until cfg.issueWidth)
     irLine(i).init(rv.nop)
-  val active = Reg(UInt(cfg.issueWidth bits)) init(1)
+  val active = Reg(UInt(cfg.issueWidth bits)) init(1) simPublic
   val finished = Vec.fill(cfg.issueWidth)(Bool)
-  val jumping = Bool
-  val jumped = Reg(Bool).init(False)
+  val jumping = Bool  simPublic
+  val jumped = Reg(Bool).init(False)  simPublic
   val ir2 = Reg(Bits(cfg.xlen * cfg.issueWidth bits)).assignDontCare()
   val killAfter = Bits(cfg.issueWidth bits).simPublic
   val killCur   = Bits(cfg.issueWidth bits).simPublic
@@ -250,14 +249,12 @@ class Pipeline(val cfg: SurovConfig) {
 
   imem.valid.assignDontCare
   dmem.valid.assignDontCare
-  val fetchedJump = Reg(Bool) init(False)
+  val fetchedJump = Reg(Bool) init(False) simPublic
   var ss: SoftStage = SoftStage.SoftS1
 
   def build(plugins: Seq[InstImpl]) {
     jumping := False
-    when (pipes(0).stage === Stage.S1) { // S1 is sync across all pipes anyway
-      imem.readReq(pc + 4*cfg.issueWidth)
-    }
+    imem.readReq(pc + 4*cfg.issueWidth)
     killAfter.clearAll
     killCur.clearAll
     finished.clearAll
@@ -297,7 +294,10 @@ class Pipeline(val cfg: SurovConfig) {
         c.active := False
       }
     }
-    when (finished.asBits.andR) {
+    when (finished.asBits.andR & {
+      val last = pipes(cfg.issueWidth-1)
+      !(last.active & last.stage === Stage.S1)
+    }) {
       when(jumping | jumped) {
         for (i <- 0 until cfg.issueWidth)
           irLine(i) := imem.readData(i*cfg.xlen, cfg.xlen bits)
@@ -333,7 +333,7 @@ class Pipeline(val cfg: SurovConfig) {
   }
 
   def fetch_jump(c: IExContext, target: UInt) = {
-    when (c.active) {
+    when (c.active & ~c.kill) {
       pc2 := target
       ir2 := imem.readData
       fetchedJump := True
