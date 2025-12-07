@@ -22,7 +22,7 @@ abstract class InstImpl(p: Pipeline) {
     c.r1 := c.rf1.read(rv.rs1(c.ir)).asUInt
     if (p.cfg.enableDualPort)
       c.r2 := c.rf2.get.read(rv.rs2(c.ir)).asUInt
-    p.nextStage(c)
+    c.nextStage
   }
   def getS2(c: IExContext) {}
   def getS3(c: IExContext) {}
@@ -36,7 +36,7 @@ class OpOpImpl(p: Pipeline) extends InstImpl(p) {
       getExe(c)
     } else {
       c.r2 := c.rf1.read(rv.rs2(c.ir)).asUInt
-      p.nextStage(c)
+      c.nextStage
     }
   }
   override def getS3(c: IExContext) {
@@ -49,7 +49,7 @@ class OpOpImpl(p: Pipeline) extends InstImpl(p) {
     c.r2 := shamt_rem.resize(c.r2.getWidth)      
     when(c.alu.ready) {
       c.rf1.write(c, rv.rd(c.ir), c.alu.result.asBits) // FIXME
-      p.finish(c)
+      c.finish
     }
   }
 }
@@ -62,7 +62,7 @@ class OpImmImpl(p: Pipeline) extends InstImpl(p) {
     c.r2 := shamt_rem.resize(c.r2.getWidth)      
     when(c.alu.ready) {
       c.rf1.write(c, rv.rd(c.ir), c.alu.result.asBits) // FIXME
-      p.finish(c)
+      c.finish
     }
   }
 }
@@ -72,7 +72,7 @@ class AuipcImpl(p: Pipeline) extends InstImpl(p) {
   override def getReads(c: IExContext) = B(0)
   override def getS1(c: IExContext) {
     c.rf1.write(c, rv.rd(c.ir), c.add(c.pc, rv.imm_u(c.ir).asUInt).asBits)
-    p.finish(c)
+    c.finish
   }
 }
 
@@ -82,7 +82,7 @@ class LuiImpl(p: Pipeline) extends InstImpl(p) {
 
   override def getS1(c: IExContext) {
     c.rf1.write(c, rv.rd(c.ir), rv.imm_u(c.ir).asBits)
-    p.finish(c)
+    c.finish
   }
 }
 
@@ -92,11 +92,11 @@ class LoadImpl(p: Pipeline) extends InstImpl(p) {
     val address = c.add(c.r1, rv.imm_i(c.ir).asUInt)
     c.r1 := address
     p.dmem.readReq(address)
-    p.nextStage(c)
+    c.nextStage
   }
   override def getS3(c: IExContext) = {
     c.rf1.write(c, rv.rd(c.ir), p.dmem.readRsp(c.r1, Some(rv.funct3(c.ir))))
-    p.finish(c)
+    c.finish
   }
 }
 
@@ -110,7 +110,7 @@ class StoreImpl(p: Pipeline) extends InstImpl(p) {
       c.rf1.read(rv.rs2(c.ir)),
       Some (rv.funct3(c.ir))
     )
-    p.finish(c)
+    c.finish
   }
 }
 class JalImpl(p: Pipeline) extends  InstImpl(p) {
@@ -120,7 +120,7 @@ class JalImpl(p: Pipeline) extends  InstImpl(p) {
   override def getS1(c: IExContext): Unit = {
     c.rf1.write(c, rv.rd(c.ir), c.pc + 4 asBits)
     p.fetch_jump(c, c.add(c.pc, rv.imm_j(c.ir).asUInt))
-    p.nextStage(c)
+    c.nextStage
   }
   override def getS2(c: IExContext): Unit = {
     p.take_jump(c)
@@ -132,7 +132,7 @@ class JalrImpl(p: Pipeline) extends InstImpl(p) {
   override val KillFollowing = true
   override def getS2(c: IExContext): Unit = {
     p.fetch_jump(c, c.add(c.r1, rv.imm_i(c.ir).asUInt))
-    p.nextStage(c)
+    c.nextStage
   }
   override def getS3(c: IExContext) = {
     c.rf1.write(c, rv.rd(c.ir), c.pc + 4 asBits)
@@ -149,20 +149,23 @@ class SysImpl(p: Pipeline) extends InstImpl(p) {
   val counter = Reg(UInt(2 bits))
   override def getS1(c: IExContext): Unit = {
     counter := 3
-    p.nextStage(c)
+    c.nextStage
   }
 
   override def getS2(c: IExContext): Unit = {
     counter := counter - 1
-    when (counter === U(0, 2 bits)) (p.nextStage(c))
+    when (counter === U(0, 2 bits)) (c.nextStage)
   }
 
-  override def getS3(c: IExContext): Unit = p.finish(c)
+  override def getS3(c: IExContext): Unit = {
+    c.trap := True
+    c.finish
+  }
 }
 
 class FenceImpl(p: Pipeline) extends InstImpl(p) {
   override def opcode: Opcode.C = Opcode.Fence
-  override def getS2(c: IExContext): Unit = p.finish(c)
+  override def getS2(c: IExContext): Unit = c.finish
 }
 
 class BranchImpl(p: Pipeline) extends InstImpl(p) {
@@ -183,12 +186,12 @@ class BranchImpl(p: Pipeline) extends InstImpl(p) {
     if (p.cfg.enableDualPort) {
       p.fetch_jump(c, p.pc2)
       when(!c.compute(c.r1, c.r2)._1(0)) {
-        p.finish(c)
-      } otherwise p.nextStage(c)
+        c.finish
+      } otherwise c.nextStage
     } else {
       p.fetch_jump(c, c.add(c.pc, rv.imm_b(c.ir).asUInt))
       c.r2 := c.rf1.read(rv.rs2(c.ir)).asUInt
-      p.nextStage(c)
+      c.nextStage
     }
   }
 
@@ -199,7 +202,7 @@ class BranchImpl(p: Pipeline) extends InstImpl(p) {
       when(c.compute(c.r1, c.r2)._1(0)) {
         p.take_jump(c)
       } otherwise {
-        p.finish(c)
+        c.finish
       }
     }
   }

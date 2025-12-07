@@ -66,20 +66,17 @@ object Surov3CoreSim extends App {
         cycles += 1
         pw.println(f"[cycle ${cycles}%03d] Pipes state:")
         pw.println(s"fetchedJump: ${pl.fetchedJump.toBoolean} jumping ${pl.jumping.toBoolean} jumped: ${pl.jumped.toBoolean}")
-        pw.println(s"irLine:    ${pl.irLine.map(_.toLong.toHexString)}")
+        pw.println(s"irLine:    ${pl.irBuf.map(_.toLong.toHexString)}")
         pw.println(s"regReads:  ${pl.regReads.map(_.toLong.toBinaryString)}")
         pw.println(s"regWrites: ${pl.regWrites.map(_.toLong.toBinaryString)}")
         // println(s"readScan:  ${pl.readScan.map(_.toLong.toBinaryString)}")
         // println(s"writeScan: ${pl.writeScan.map(_.toLong.toBinaryString)}")
-        pw.println(s"killCurr:  ${pl.killCur.toLong.toBinaryString}")
+        pw.println(s"stall: ${pl.stall.toLong.toBinaryString}")
         pw.println(f"kills: ${pl.kill.toLong.toBinaryString}")
         for (c <- pl.pipes) {
-          pw.println(f"(${c.id}) ${if (c.active.toBoolean) "✓" else "✗"} ${if ((pl.kill.toLong >> c.id & 1) == 0) "✓" else "✗"} ${c.stage.toEnum} pc: ${c.pc.toLong}%08x ir: ${c.ir.toLong}%08x")
+          pw.println(f"(${c.id}) ${if (c.finished.toBoolean) "F" else if (c.kill.toBoolean) "K" else if (c.stall.toBoolean) "S" else " "} ${c.stage.toEnum} pc: ${c.pc.toLong}%08x ir: ${c.ir.toLong}%08x")
         }
-        if (pl.pipes(0).stage.toEnum == Stage.S1) {
-          // println(f"kill ${pl.kill.toInt.toBinaryString} active: ${pl.active.toInt.toBinaryString} (a & ~k): ${(pl.kill.toLong & ~pl.active.toLong).toBinaryString} count: ${java.lang.Long.bitCount(pl.kill.toLong & ~pl.active.toLong)}")
-          instsRet += java.lang.Long.bitCount(~pl.kill.toLong & pl.active.toLong)
-        }
+        instsRet += pl.pipes.count(c => c.stage.toEnum == Stage.S1 && !c.stall.toBoolean && !c.kill.toBoolean)
         pw.println(f"InstsRet after: ${instsRet}")
         val trap = dut.trap.toInt
         val c = if (trap != 0) pl.pipes(Integer.numberOfTrailingZeros(trap)) else null

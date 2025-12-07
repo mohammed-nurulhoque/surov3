@@ -2,7 +2,7 @@ package surov3
 import spinal.core._
 
 object Utils {
-    implicit class UIntOps(val x: UInt) extends AnyVal {
-    def fillDownToLSO(): UInt = ~x ^ (x - 1)
+    implicit class UIntOps(val x: Bits) extends AnyVal {
+    def fillDownToLSO(): Bits = ~x ^ (x.asUInt - 1).asBits
     }
 }

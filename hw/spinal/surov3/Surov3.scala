@@ -7,7 +7,7 @@ import surov3.Utils._
 case class SurovConfig(
   regCount: Int = 32,
   enableDualPort: Boolean = true,
-  enableZba: Boolean = false,
+  // enableZba: Boolean = false,
   issueWidth: Int = 2,
   enableForward: Boolean = false,
   xlen: Int = 32,
@@ -15,20 +15,19 @@ case class SurovConfig(
 
 class RFIF(xlen: Int, regCount: Int) extends Bundle {
   val addr = out UInt(log2Up(regCount) bits) assignDontCare
-  val wren = out Bool(false)
+  val wren = out (False)
   val writeData = out Bits(xlen bits) assignDontCare
   val readData = in Bits(xlen bits)
 
   /** Async read */
   def read(regnum: UInt) = {
     addr := regnum
-    wren := False
     readData
   }
   
   def write(c: IExContext, regnum: UInt, value: Bits) {
     addr := regnum
-    wren := c.active & ~c.kill
+    wren := ~c.stall & ~c.kill
     writeData := value
   }
 }
@@ -38,7 +37,7 @@ class MemIF(val xlen: Int, val wordBytes: Int, val writable: Boolean) extends Bu
   val readData = in Bits(wordBytes*8 bits)
   val valid = out Bool
   val ready = in Bool
-  val wren      = Option.when(writable)(out Bool() assignDontCare)
+  val wren      = Option.when(writable)(out (Bool))
   val wmask     = Option.when(writable)(out Bits(wordBytes*8 bits) assignDontCare)
   val writeData = Option.when(writable)(out Bits(wordBytes*8 bits) assignDontCare)
 
@@ -178,15 +177,21 @@ object SoftStage {
 }
 
 class IExContext(cfg: SurovConfig, val id: Int,
-  val pc: UInt, val ir: Bits,
-  val active: Bool, val kill: Bool, val finished: Bool)
-{
+  val pc : UInt,
+  val ir : Bits,
+  val stall : Bool,
+  val kill  : Bool,
+) {
+  val stage     = Reg(Stage).init(Stage.S1).simPublic()
+  val finished  = False.simPublic
+  val trap      = False
+
   pc.simPublic
   ir.simPublic
-  active.simPublic
-  val stage = Reg(Stage).init(Stage.S1).simPublic()
-  val start = out (Reg(Bool)) init(True)
+  stall.simPublic
+  kill.simPublic
 
+  val start = out (Reg (Bool) init(True))
   val r1 = Reg(UInt(cfg.xlen bits)).simPublic()
   val r2 = Reg(UInt(cfg.xlen bits)).simPublic()
   val alu = new ALU(cfg.xlen, cfg.regCount)
@@ -197,6 +202,35 @@ class IExContext(cfg: SurovConfig, val id: Int,
   List(alu.src_a, alu.src_b, alu.start) map (_.assignDontCare)
   List(alu.arith_bit, alu.shadd, alu.branch) map (_ := False)
 
+  when (kill) { _finish() }
+  when(!alu.ready) {  // FIXME an instruction can choose to stall for other reasons
+    start := False
+  }
+  when(stage === Stage.S0) (finished := True)
+
+  def nextStage() {
+    when (~kill & ~stall) {
+      start := True
+      switch(stage) {
+        is(Stage.S1) { stage := Stage.S2 }
+        is(Stage.S2) { stage := Stage.S3 }
+      }
+    }
+  }
+
+  def reset(dead: Bool) {
+    stage := dead ? Stage.S0 | Stage.S1
+    start := True
+  }
+
+  def _finish() {
+    stage := Stage.S0
+    finished := True
+  }
+
+  def finish() {
+    when(~stall) { _finish() }
+  }
 
   def add(a: UInt, b: UInt) = {
     alu.src_a := a
@@ -218,51 +252,45 @@ class IExContext(cfg: SurovConfig, val id: Int,
 }
 
 class Pipeline(val cfg: SurovConfig) {
-  val pc = Reg(UInt(cfg.xlen bits)) init(0) simPublic
+  val pcBase = Reg(UInt(cfg.xlen bits)) init(0) simPublic
   val pc2 = Reg(UInt(cfg.xlen bits)).assignDontCare()
-  val irLine = Vec.fill(cfg.issueWidth)(Reg(Bits(cfg.xlen bits))).simPublic
-  irLine(0).init(Opcode.Jal.asBits.resize(32) | 0x1000)
-  for (i <- 1 until cfg.issueWidth)
-    irLine(i).init(rv.nop)
-  val active = Reg(UInt(cfg.issueWidth bits)) init(1) simPublic
-  val finished = Vec.fill(cfg.issueWidth)(Bool)
-  val jumping = Bool  simPublic
+  val irBuf = Vec.fill(cfg.issueWidth)(Reg(Bits(cfg.xlen bits))).simPublic
+  irBuf(0).init(Opcode.Jal.asBits.resize(32) | 0x1000)
+  irBuf.drop(1).foreach(_.init(rv.nop))
+  val jumping = False  simPublic
   val jumped = Reg(Bool).init(False)  simPublic
-  val ir2 = Reg(Bits(cfg.xlen * cfg.issueWidth bits)).assignDontCare()
-  val killAfter = Bits(cfg.issueWidth bits).simPublic
-  val killCur   = Bits(cfg.issueWidth bits).simPublic
-  val kill = (killAfter | (killCur |>> 1)).asUInt.fillDownToLSO simPublic
+  val ir2 = Reg(Bits(cfg.xlen * cfg.issueWidth bits)).assignDontCare
+  val reset = B(False, cfg.issueWidth)
+  val killAfter = B(False, cfg.issueWidth).simPublic
+  val kill  = killAfter.fillDownToLSO.simPublic // control hazards
+  val stall   = B(False, cfg.issueWidth) simPublic // data hazards
   val regReads = Vec.fill(cfg.issueWidth)(Bits(cfg.regCount bits).simPublic)
   val regWrites = Vec.fill(cfg.issueWidth)(Bits(cfg.regCount bits).simPublic)
-  val readScan = Vec(regReads.scanLeft(B(0, cfg.regCount bits) simPublic)(_ | _ simPublic)).simPublic
-  val writeScan = Vec(regWrites.scanLeft(B(0, cfg.regCount bits) simPublic)(_ | _ simPublic)).simPublic
-  val pipes =
+  val readScan = Vec(regReads.scanLeft(B(0, cfg.regCount bits))(_ | _)).simPublic
+  val writeScan = Vec(regWrites.scanLeft(B(0, cfg.regCount bits))(_ | _)).simPublic
+  val pipes = 
     for (i <- 0 until cfg.issueWidth)
-    yield new IExContext(cfg, i, pc + 4*i, irLine(i), active(i), kill(i), finished(i))
-  val trap = Vec(irLine
-    .map(rv.opcode(_) === Opcode.Sys)
-    .zip((active & ~kill).asBools)
-    .map({case (a, b) => a & b})) asBits
+    yield new IExContext(cfg, i, pcBase + 4*i, irBuf(i), stall(i), kill(i))
+  
+  val finished = Vec(pipes.map (_.finished))
+  val trap = Vec(pipes.map (_.trap)).asBits
+
+  val alive = Vec(pipes.map(_.stage =/= Stage.S0)).asBits & ~kill
+  val active = (alive & ~stall)
+  alive.simPublic
+  active.simPublic
 
   val imem = new MemIF(cfg.xlen, cfg.xlen / 8 * cfg.issueWidth, false)
   val dmem = new MemIF(cfg.xlen, cfg.xlen / 8, true)
+  dmem.valid := False
+  dmem.wren.foreach(_ := False)
 
-  imem.valid.assignDontCare
-  dmem.valid.assignDontCare
   val fetchedJump = Reg(Bool) init(False) simPublic
   var ss: SoftStage = SoftStage.SoftS1
 
   def build(plugins: Seq[InstImpl]) {
-    jumping := False
-    imem.readReq(pc + 4*cfg.issueWidth)
-    killAfter.clearAll
-    killCur.clearAll
-    finished.clearAll
+    imem.readReq(pcBase + 4*cfg.issueWidth)
     for ((c, i) <- pipes.zipWithIndex) {
-      when(!c.alu.ready) {  // FIXME an instruction can choose to stall for other reasons
-        c.start := False
-      }
-      when(c.stage === Stage.S0 | !c.active | kill(i)) (c.finished := True)
       switch(rv.opcode(c.ir)) {
         for (p <- plugins) {
           is(p.opcode) {
@@ -274,66 +302,51 @@ class Pipeline(val cfg: SurovConfig) {
                 }
               }
             }
-            regReads(i) := c.active ? p.getReads(c) | B(0, cfg.regCount bits)
-            regWrites(i) := c.active ? p.getWrites(c) | B(0, cfg.regCount bits)
+            regReads(i) := p.getReads(c) & Vec.fill(cfg.regCount)(c.stage =/= Stage.S0).asBits
+            regWrites(i) := p.getWrites(c) & Vec.fill(cfg.regCount)(c.stage =/= Stage.S0).asBits
             if (p.KillFollowing) {
-              when(c.active) (killAfter(i) set)
+              when(c.stage =/= Stage.S0) (killAfter(i) set)
             }
+            // TODO precise hazards
             val raw = (regReads(i) & writeScan(i)).asUInt.clearedLow(1).orR
-            val war = (regWrites(i) & readScan(i)).asUInt.clearedLow(1).orR // TODO war not issue with dual port?
-            val waw = (regWrites(i) & writeScan(i)).asUInt.clearedLow(1).orR // TODO waw shouldn't happen in normal code
-            when (c.active & (raw | war | waw)) (killCur(i) set)
+            val war = (regWrites(i) & readScan(i)).asUInt.clearedLow(1).orR
+            val waw = (regWrites(i) & writeScan(i)).asUInt.clearedLow(1).orR // TODO waw shouldn't happen in normal code?
+            when (alive(i) & (raw | war | waw)) (stall(i) set)
           }
           default {}
         }
       }
     }
-    for ((c, i) <- pipes.zipWithIndex) {
-      when(kill(i)) {
-        c.stage := Stage.S0
-        c.active := False
-      }
-    }
-    when (finished.asBits.andR & {
-      val last = pipes(cfg.issueWidth-1)
-      !(last.active & last.stage === Stage.S1)
-    }) {
+    // if the last inst in the issue group is at S1, we didn't get to
+    // fetch the next instructions yet.
+    when (finished.asBits.andR & pipes(cfg.issueWidth-1).stage =/= Stage.S1) {
       when(jumping | jumped) {
         for (i <- 0 until cfg.issueWidth)
-          irLine(i) := imem.readData(i*cfg.xlen, cfg.xlen bits)
-        pc := pc2.clearedLow(2 + log2Up(cfg.issueWidth))
-        active := ~((U(1) << pc2(2, log2Up(cfg.issueWidth) bits)) - 1)
-      } elsewhen ((active & ~kill)(cfg.issueWidth-1)) {
+          irBuf(i) := imem.readData(i*cfg.xlen, cfg.xlen bits)
+        pcBase := pc2.clearedLow(2 + log2Up(cfg.issueWidth))
+        val dead = (U(1) << pc2(2, log2Up(cfg.issueWidth) bits)) - 1
+        for (c <- pipes) {
+          c.reset (dead(c.id))
+        }
+      } elsewhen (kill.msb) {
+        // a branch that was not taken and is not last in issue group.
+        // Revive instructions after branch
+        for (c <- pipes)
+          c.reset(~kill(c.id))
+      } otherwise {
         val irSrc = fetchedJump ? ir2 | imem.readData
         for (i <- 0 until cfg.issueWidth)
-          irLine(i) := irSrc(i*cfg.xlen, cfg.xlen bits)
-        pc := (pc + 4*cfg.issueWidth).clearedLow(2 + log2Up(cfg.issueWidth))
-        active.setAll()
-      } otherwise {
-        active := ((k: UInt) => ~((k-1) | k))(active & ~kill) // XXX FIXME
+          irBuf(i) := irSrc(i*cfg.xlen, cfg.xlen bits)
+        pcBase := pcBase + 4*cfg.issueWidth
+        pipes.foreach(_.reset(False))
       }
       jumped := False
       fetchedJump := False
-      for (c <- pipes) {
-        c.start := True
-        c.stage := Stage.S1
-      }
-    } otherwise {
-      for (c <- pipes)
-        when(c.finished) (c.stage := Stage.S0)
-    }
-  }
-
-  def nextStage(c: IExContext) {
-    c.start := True
-    switch(c.stage) {
-      is(Stage.S1) { c.stage := Stage.S2 }
-      is(Stage.S2) { c.stage := Stage.S3 }
     }
   }
 
   def fetch_jump(c: IExContext, target: UInt) = {
-    when (c.active & ~c.kill) {
+    when (~kill(c.id)) {
       pc2 := target
       ir2 := imem.readData
       fetchedJump := True
@@ -341,24 +354,19 @@ class Pipeline(val cfg: SurovConfig) {
     }
   }
 
+  // has to happen on a later cycle than fetch_jump
+  // thus, doesn't need guarding with c.stall
   def take_jump(c: IExContext) {
     jumping := True
     jumped := True
-    c.finished := True
-  }
-
-  def finish(c: IExContext) {
-    c.finished := True
-    // if (ss == SoftStage.SoftS1) c.stage := Stage.S0
-    // else forward(c, fetchedJump)
+    c.finish
   }
 }
 
 // Hardware definition
 case class Surov3Core(cfg: SurovConfig) extends Component {
   val pipeline = new Pipeline(cfg)
-  val trap = out Bits(cfg.issueWidth bits)
-  trap := pipeline.trap
+  val trap = out (pipeline.trap)
   val plugins = Seq(
     new OpOpImpl(pipeline),
     new OpImmImpl(pipeline),
@@ -396,8 +404,8 @@ case class Surov3Top(cfg: SurovConfig) extends Component {
 
 case class SimDUT(cfg: SurovConfig) extends Component {
   val top = Surov3Top(cfg)
-  val trap = out Bits(cfg.issueWidth bits)
-  trap := top.trap.simPublic()
+  val trap = out (Bits(cfg.issueWidth bits)).simPublic
+  trap := top.trap
   val mem = Mem(Bits(cfg.xlen * cfg.issueWidth bits), wordCount = 1 << 14).simPublic
   top.imemIF.readData := mem.readSync(
     address = top.imemIF.addr.resize(14),
