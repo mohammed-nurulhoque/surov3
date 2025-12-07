@@ -6,9 +6,9 @@ import surov3.Utils._
 
 case class SurovConfig(
   regCount: Int = 32,
-  enableDualPort: Boolean = true,
+  enableDualPort: Boolean = false,
   // enableZba: Boolean = false,
-  issueWidth: Int = 2,
+  issueWidth: Int = 4,
   enableForward: Boolean = false,
   xlen: Int = 32,
 )
@@ -155,25 +155,26 @@ object Stage extends SpinalEnum {
 }
 
 sealed trait SoftStage {
-  def toInt: Int
   def harden: Stage.C
 }
 
 object SoftStage {
-  case object SoftS1 extends SoftStage { def toInt = 1; def harden = Stage.S1 }
-  case object SoftS2 extends SoftStage { def toInt = 2; def harden = Stage.S2 }
-  case object SoftS3 extends SoftStage { def toInt = 3; def harden = Stage.S3 }
-
-  def fromInt(i: Int): SoftStage = i match {
-    case 1 => SoftS1
-    case 2 => SoftS2
-    case 3 => SoftS3
-  }
+  case object SoftS1 extends SoftStage { def harden = Stage.S1 }
+  case object SoftS2 extends SoftStage { def harden = Stage.S2 }
+  case object SoftS3 extends SoftStage { def harden = Stage.S3 }
 
   def succ(ss: SoftStage) = ss match {
     case SoftS1 => SoftS2
     case SoftS2 => SoftS3
   }
+
+  def following(ss: SoftStage): Seq[SoftStage] = ss match {
+    case SoftS1 => Seq(SoftS2, SoftS3)
+    case SoftS2 => Seq(SoftS3)
+    case SoftS3 => Seq()
+  }
+  
+  def currentAndFollowing(ss: SoftStage): Seq[SoftStage] = ss +: following(ss)
 }
 
 class IExContext(cfg: SurovConfig, val id: Int,
@@ -262,23 +263,36 @@ class Pipeline(val cfg: SurovConfig) {
   val ir2 = Reg(Bits(cfg.xlen * cfg.issueWidth bits)).assignDontCare
   val reset = B(False, cfg.issueWidth)
   val killAfter = B(False, cfg.issueWidth).simPublic
-  val kill  = killAfter.fillDownToLSO.simPublic // control hazards
-  val stall   = B(False, cfg.issueWidth) simPublic // data hazards
-  val regReads = Vec.fill(cfg.issueWidth)(Bits(cfg.regCount bits).simPublic)
-  val regWrites = Vec.fill(cfg.issueWidth)(Bits(cfg.regCount bits).simPublic)
-  val readScan = Vec(regReads.scanLeft(B(0, cfg.regCount bits))(_ | _)).simPublic
-  val writeScan = Vec(regWrites.scanLeft(B(0, cfg.regCount bits))(_ | _)).simPublic
-  val pipes = 
+  val kill  = killAfter.fillDownToLSO.asBools.simPublic // control hazards
+  val regReads = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits).simPublic)
+  val regWrites = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits).simPublic)
+  val regRemReads = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic.addAttribute("keep")
+  val regRemWrites = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic.addAttribute("keep")
+  val readScan = Vec(regRemReads.scanLeft(B(0, cfg.regCount bits))(_ | _)).addAttribute("keep")
+  val writeScan = Vec(regRemWrites.scanLeft(B(0, cfg.regCount bits))(_ | _)).simPublic.addAttribute("keep")
+
+  val checkOverlap: (Vec[Bits], Vec[Bits]) => Vec[Bool] = {
+    case (access, scan) => Vec(access.zip(scan)
+    .map({ case (a, b) => (a & b).asUInt.clearedLow(1).orR }))
+  }
+  val raw = checkOverlap (regReads, writeScan) simPublic
+  val war = checkOverlap (regWrites, readScan) simPublic
+  val waw = checkOverlap (regWrites, writeScan) simPublic
+  val stall = Vec.fill(cfg.issueWidth)(Bool)
+  val pipes: IndexedSeq[IExContext] =
     for (i <- 0 until cfg.issueWidth)
     yield new IExContext(cfg, i, pcBase + 4*i, irBuf(i), stall(i), kill(i))
-  
+
+  val occupied = Vec(pipes.map(_.stage =/= Stage.S0))
+  val alive = occupied & ~kill  
+  stall := alive & (raw | war | waw)
+  val active = alive & ~stall
+  alive.simPublic 
+  active.simPublic
+
+  // for convenience
   val finished = Vec(pipes.map (_.finished))
   val trap = Vec(pipes.map (_.trap)).asBits
-
-  val alive = Vec(pipes.map(_.stage =/= Stage.S0)).asBits & ~kill
-  val active = (alive & ~stall)
-  alive.simPublic
-  active.simPublic
 
   val imem = new MemIF(cfg.xlen, cfg.xlen / 8 * cfg.issueWidth, false)
   val dmem = new MemIF(cfg.xlen, cfg.xlen / 8, true)
@@ -286,7 +300,6 @@ class Pipeline(val cfg: SurovConfig) {
   dmem.wren.foreach(_ := False)
 
   val fetchedJump = Reg(Bool) init(False) simPublic
-  var ss: SoftStage = SoftStage.SoftS1
 
   def build(plugins: Seq[InstImpl]) {
     imem.readReq(pcBase + 4*cfg.issueWidth)
@@ -295,23 +308,19 @@ class Pipeline(val cfg: SurovConfig) {
         for (p <- plugins) {
           is(p.opcode) {
             switch (c.stage) {
-              for (stage_i <- List(1, 2, 3)) {
-                ss = SoftStage.fromInt(stage_i)
+              for (ss <- List(SoftStage.SoftS1, SoftStage.SoftS2, SoftStage.SoftS3)) {
                 is(ss.harden) {
                   p.getStage(c, ss)
+                  regReads(i) := p.getStageReads(c, ss) & (occupied(i) #* cfg.regCount)
+                  regWrites(i) := p.getStageWrites(c, ss) & (occupied(i) #* cfg.regCount)
+                  regRemReads(i) := p.getReadRem(c, ss) & (occupied(i) #* cfg.regCount)
+                  regRemWrites(i) := p.getWriteRem(c, ss) & (occupied(i) #* cfg.regCount)
                 }
               }
             }
-            regReads(i) := p.getReads(c) & Vec.fill(cfg.regCount)(c.stage =/= Stage.S0).asBits
-            regWrites(i) := p.getWrites(c) & Vec.fill(cfg.regCount)(c.stage =/= Stage.S0).asBits
             if (p.KillFollowing) {
               when(c.stage =/= Stage.S0) (killAfter(i) set)
             }
-            // TODO precise hazards
-            val raw = (regReads(i) & writeScan(i)).asUInt.clearedLow(1).orR
-            val war = (regWrites(i) & readScan(i)).asUInt.clearedLow(1).orR
-            val waw = (regWrites(i) & writeScan(i)).asUInt.clearedLow(1).orR // TODO waw shouldn't happen in normal code?
-            when (alive(i) & (raw | war | waw)) (stall(i) set)
           }
           default {}
         }
@@ -328,7 +337,7 @@ class Pipeline(val cfg: SurovConfig) {
         for (c <- pipes) {
           c.reset (dead(c.id))
         }
-      } elsewhen (kill.msb) {
+      } elsewhen (kill.last) {
         // a branch that was not taken and is not last in issue group.
         // Revive instructions after branch
         for (c <- pipes)
