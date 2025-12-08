@@ -62,7 +62,7 @@ abstract class InstImpl(p: Pipeline) {
     c.r1 := c.rf1.read(rv.rs1(c.ir)).asUInt
     if (p.cfg.enableDualPort)
       c.r2 := c.rf2.get.read(rv.rs2(c.ir)).asUInt
-    c.nextStage
+    p.nextStage(c.id)
   }
   def getS2(c: IExContext) {}
   def getS3(c: IExContext) {}
@@ -90,7 +90,7 @@ class OpOpImpl(p: Pipeline) extends InstImpl(p) {
       getExe(c)
     } else {
       c.r2 := c.rf1.read(rv.rs2(c.ir)).asUInt
-      c.nextStage
+      p.nextStage(c.id)
     }
   }
   override def getS3(c: IExContext) {
@@ -103,7 +103,7 @@ class OpOpImpl(p: Pipeline) extends InstImpl(p) {
     c.r2 := shamt_rem.resize(c.r2.getWidth)
     when(c.alu.ready) {
       c.rf1.write(c, rv.rd(c.ir), c.alu.result.asBits) // FIXME
-      c.finish
+      p.finish(c.id)
     }
   }
 }
@@ -118,7 +118,7 @@ class OpImmImpl(p: Pipeline) extends InstImpl(p) {
     c.r2 := shamt_rem.resize(c.r2.getWidth)
     when(c.alu.ready) {
       c.rf1.write(c, rv.rd(c.ir), c.alu.result.asBits) // FIXME
-      c.finish
+      p.finish(c.id)
     }
   }
 }
@@ -129,7 +129,7 @@ class AuipcImpl(p: Pipeline) extends InstImpl(p) {
   override def getWritesS1(c: IExContext): Bits = B(1) << rv.rd(c.ir)
   override def getS1(c: IExContext) {
     c.rf1.write(c, rv.rd(c.ir), c.add(c.pc, rv.imm_u(c.ir).asUInt).asBits)
-    c.finish
+    p.finish(c.id)
   }
 }
 
@@ -139,7 +139,7 @@ class LuiImpl(p: Pipeline) extends InstImpl(p) {
   override def getWritesS1(c: IExContext): Bits = B(1) << rv.rd(c.ir)
   override def getS1(c: IExContext) {
     c.rf1.write(c, rv.rd(c.ir), rv.imm_u(c.ir).asBits)
-    c.finish
+    p.finish(c.id)
   }
 }
 
@@ -150,11 +150,11 @@ class LoadImpl(p: Pipeline) extends InstImpl(p) {
     val address = c.add(c.r1, rv.imm_i(c.ir).asUInt)
     c.r1 := address
     p.dmem.readReq(address)
-    c.nextStage
+    p.nextStage(c.id)
   }
   override def getS3(c: IExContext) = {
     c.rf1.write(c, rv.rd(c.ir), p.dmem.readRsp(c.r1, Some(rv.funct3(c.ir))))
-    c.finish
+    p.finish(c.id)
   }
 }
 
@@ -167,7 +167,7 @@ class StoreImpl(p: Pipeline) extends InstImpl(p) {
       c.rf1.read(rv.rs2(c.ir)),
       Some (rv.funct3(c.ir))
     )
-    c.finish
+    p.finish(c.id)
   }
 }
 class JalImpl(p: Pipeline) extends  InstImpl(p) {
@@ -178,7 +178,7 @@ class JalImpl(p: Pipeline) extends  InstImpl(p) {
   override def getS1(c: IExContext): Unit = {
     c.rf1.write(c, rv.rd(c.ir), c.pc + 4 asBits)
     p.fetch_jump(c, c.add(c.pc, rv.imm_j(c.ir).asUInt))
-    c.nextStage
+    p.nextStage(c.id)
   }
   override def getS2(c: IExContext): Unit = {
     p.take_jump(c)
@@ -192,7 +192,7 @@ override def getWritesS2(c: IExContext): Bits = B(1) << rv.rd(c.ir)
 
   override def getS2(c: IExContext): Unit = {
     p.fetch_jump(c, c.add(c.r1, rv.imm_i(c.ir).asUInt))
-    c.nextStage
+    p.nextStage(c.id)
   }
   override def getS3(c: IExContext) = {
     c.rf1.write(c, rv.rd(c.ir), c.pc + 4 asBits)
@@ -209,23 +209,23 @@ class SysImpl(p: Pipeline) extends InstImpl(p) {
   val counter = Reg(UInt(2 bits))
   override def getS1(c: IExContext): Unit = {
     counter := 3
-    c.nextStage
+    p.nextStage(c.id)
   }
 
   override def getS2(c: IExContext): Unit = {
     counter := counter - 1
-    when (counter === U(0, 2 bits)) (c.nextStage)
+    when (counter === U(0, 2 bits)) (p.nextStage(c.id))
   }
 
   override def getS3(c: IExContext): Unit = {
-    c.trap := True
-    c.finish
+    p.trap(c.id) := True // breaks abstraction
+    p.finish(c.id)
   }
 }
 
 class FenceImpl(p: Pipeline) extends InstImpl(p) {
   override def opcode: Opcode.C = Opcode.Fence
-  override def getS2(c: IExContext): Unit = c.finish
+  override def getS2(c: IExContext): Unit = p.finish(c.id)
 }
 
 class BranchImpl(p: Pipeline) extends InstImpl(p) {
@@ -254,12 +254,12 @@ class BranchImpl(p: Pipeline) extends InstImpl(p) {
     if (p.cfg.enableDualPort) {
       p.fetch_jump(c, p.pc2)
       when(!c.compute(c.r1, c.r2)._1(0)) {
-        c.finish
-      } otherwise c.nextStage
+        p.finish(c.id)
+      } otherwise p.nextStage(c.id)
     } else {
       p.fetch_jump(c, c.add(c.pc, rv.imm_b(c.ir).asUInt))
       c.r2 := c.rf1.read(rv.rs2(c.ir)).asUInt
-      c.nextStage
+      p.nextStage(c.id)
     }
   }
 
@@ -270,7 +270,7 @@ class BranchImpl(p: Pipeline) extends InstImpl(p) {
       when(c.compute(c.r1, c.r2)._1(0)) {
         p.take_jump(c)
       } otherwise {
-        c.finish
+        p.finish(c.id)
       }
     }
   }

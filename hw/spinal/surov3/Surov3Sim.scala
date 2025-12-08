@@ -67,6 +67,7 @@ object Surov3CoreSim extends App {
         pw.println(f"[cycle ${cycles}%03d] Pipes state:")
         pw.println(s"fetchedJump: ${pl.fetchedJump.toBoolean} jumping ${pl.jumping.toBoolean} jumped: ${pl.jumped.toBoolean}")
         pw.println(s"irLine:       ${pl.irBuf.map(_.toLong.toHexString)}")
+        pw.println(s"ir2:          ${pl.ir2.toBigInt.toString(16)}")
         pw.println(s"regReads:     ${pl.regReads.map(_.toLong.toBinaryString)}")
         pw.println(s"regWrites:    ${pl.regWrites.map(_.toLong.toBinaryString)}")
         pw.println(s"raw:          ${pl.raw.map(_.toBoolean)}")
@@ -77,11 +78,26 @@ object Surov3CoreSim extends App {
         // pw.println(s"readScan:  ${pl.readScan.map(_.toLong.toBinaryString)}")
         // pw.println(s"writeScan: ${pl.writeScan.map(_.toLong.toBinaryString)}")
         pw.println(s"stall: ${pl.stall.map(_.toBoolean)}")
-        pw.println(f"kills: ${pl.kill.map(_.toBoolean)}")
+        pw.println(f"kills: ${pl.kill.toInt.toBinaryString}")
         for (c <- pl.pipes) {
-          pw.println(f"(${c.id}) ${if (c.finished.toBoolean) "F" else if (c.kill.toBoolean) "K" else if (c.stall.toBoolean) "S" else " "} ${c.stage.toEnum} pc: ${c.pc.toLong}%08x ir: ${c.ir.toLong}%08x")
+          pw.println(f"(${c.id}) ${
+            if (pl.finished(c.id).toBoolean) "F" 
+            else if (((pl.kill.toLong >> c.id) & 1) == 1) "K" 
+            else if (pl.stall(c.id).toBoolean) "S" 
+            else " "
+          } ${c.stage.toEnum} pc: ${c.pc.toLong}%08x ir: ${c.ir.toLong}%08x")
         }
-        instsRet += pl.pipes.count(c => c.stage.toEnum == Stage.S1 && !c.stall.toBoolean && !c.kill.toBoolean)
+
+        val sb = new StringBuilder()
+        sb.append("Registers: ")
+        for (i <- 1 to 15) {
+          val regValue = dut.top.rf.getBigInt(i) 
+          sb.append(f"x${i}%02d: ${regValue}%02d ") 
+        }
+
+// Print the collected string
+pw.println(sb.toString)
+        instsRet += pl.pipes.count(c => pl.stage(c.id).toEnum == Stage.S1 && !pl.stall(c.id).toBoolean && (((pl.kill.toLong >> c.id) & 1) != 1))
         pw.println(f"InstsRet after: ${instsRet}")
         val trap = dut.trap.toInt
         val c = if (trap != 0) pl.pipes(Integer.numberOfTrailingZeros(trap)) else null
