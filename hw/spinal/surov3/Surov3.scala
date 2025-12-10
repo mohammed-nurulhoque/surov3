@@ -38,7 +38,7 @@ class MemIF(val xlen: Int, val wordBytes: Int, val writable: Boolean) extends Bu
   val valid = out Bool
   val ready = in Bool
   val wren      = Option.when(writable)(out (Bool))
-  val wmask     = Option.when(writable)(out Bits(wordBytes*8 bits) assignDontCare)
+  val wmask     = Option.when(writable)(out Bits(wordBytes bits) assignDontCare)
   val writeData = Option.when(writable)(out Bits(wordBytes*8 bits) assignDontCare)
 
   /**
@@ -48,8 +48,9 @@ class MemIF(val xlen: Int, val wordBytes: Int, val writable: Boolean) extends Bu
     * The lower bits are dropped for the bus index.
     */
   def readReq(address: UInt): Unit = {
-    // Drop lower 2 bits to convert Byte Address -> Word Index
-    addr  := address(xlen-1 downto log2Up(wordBytes))
+    // Drop lower log2Up(wordBytes) bits to convert Byte Address -> Word Index
+    // For wordBytes=16 (4 words), this drops 4 bits
+    addr  := address.drop(log2Up(wordBytes)).asUInt
     valid := True
     wren.foreach(_ := False)
   }
@@ -62,34 +63,31 @@ class MemIF(val xlen: Int, val wordBytes: Int, val writable: Boolean) extends Bu
   def readRsp(address: UInt, funct3: Option[Bits] = None): Bits = {
     funct3 match {
       case None => 
-        // Simple Word Mode: Return data directly from bus
+        // instruction load: Return data directly from bus
         readData
 
-      case Some(f3) => // assumes wordBytes = 4
-        // RISC-V Mode: Handle alignment and extension
-        val byteOffset  = address(1 downto 0)
-        val bitOffset   = byteOffset << 3
-        val shiftedData = readData >> bitOffset
-        val result      = Bits(xlen bits)
+      case Some(f3) =>
+        // RISC-V Load : Handle alignment and extension
+        val byteOffset   = address(0, log2Up(wordBytes) bits)
+        val bitOffset    = byteOffset << 3
+        val shiftedData  = readData |>> bitOffset
+        val logbyteCount = f3.dropHigh(1).asUInt
+        val byteCount    = U(1, log2Up(wordBytes) bits) |<< logbyteCount
 
-        switch(f3) {
-          is(B"000") { // LB (Sign Extend Byte)
-            result := (shiftedData(7 downto 0).asSInt.resize(xlen bits)).asBits
-          }
-          is(B"001") { // LH (Sign Extend Half)
-            result := (shiftedData(15 downto 0).asSInt.resize(xlen bits)).asBits
-          }
-          is(B"100") { // LBU (Zero Extend Byte)
-            result := shiftedData(7 downto 0).resize(xlen bits)
-          }
-          is(B"101") { // LHU (Zero Extend Half)
-            result := shiftedData(15 downto 0).resize(xlen bits)
-          }
-          default {    // LW (Word)
-            result := shiftedData
-          }
+        // Build a contiguous bitmask (little-endian) for the requested byte/half/word
+        val bitmask = ~(~B(0, wordBytes * 8 bits) |<< (byteCount << 3))
+
+        // Pick the sign bit for the requested width
+        val msb = Bool
+        switch(logbyteCount) {
+          is(U(0, 2 bits)) { msb := shiftedData(7) }
+          is(U(1, 2 bits)) { msb := shiftedData(15) }
+          is(U(2, 2 bits)) { msb := shiftedData(31) }
+          default          { msb.assignDontCare() }
         }
-        result
+
+        val signBit = f3.msb ? False | msb // unsigned loads zero-extend
+        (shiftedData & bitmask | (~bitmask).andMask(signBit)).resize(xlen bits)
     }
   }
 
@@ -99,36 +97,17 @@ class MemIF(val xlen: Int, val wordBytes: Int, val writable: Boolean) extends Bu
     * @param data    Data to write (Right aligned / from Register File).
     * @param funct3  Optional RISC-V encoding. If None, writes full word.
     */
-  def write(address: UInt, data: Bits, funct3: Option[Bits] = None): Unit = {
+  def write(address: UInt, data: Bits, funct3:Bits): Unit = {
     assert(writable, "write to unwritable memory interface") 
-
-    valid := True
-    wren.foreach(_ := True)
-    addr  := address(xlen-1 downto 2)
-
-    funct3 match {
-      case None =>
-        // Simple Word Mode: Write full width, Mask all 1s
-        writeData.foreach(_ := data)
-        wmask.foreach(_ setAll)
-
-      case Some(f3) =>
-        // RISC-V Mode: Shift data to lane and generate specific mask
-        val byteOffset = address(1 downto 0)
-        val bitOffset  = byteOffset << 3
-        
-        // Shift data to correct byte lane
-        writeData.foreach(_ := data |<< bitOffset)
-
-        // Generate Mask
-        val baseMask = Bits(xlen bits)
-        switch(f3(1 downto 0)) {
-          is(B"00") { baseMask := B(0xFF, xlen bits) }   // Byte mask (lower 8 bits 1)
-          is(B"01") { baseMask := B(0xFFFF, xlen bits) } // Half mask (lower 16 bits 1)
-          default   { baseMask.setAll() }           // Word                                                 // Word
-        }
-        wmask.foreach(_ := baseMask |<< bitOffset)
-    }
+    val byteOffset  = address(0, log2Up(wordBytes) bits)
+    val bitOffset   = byteOffset << 3
+    val logbyteCount= funct3.dropHigh(1).asUInt
+    val byteCount   = U(1, log2Up(wordBytes) bits) |<< logbyteCount
+    valid          := True
+    wren.get       := True
+    addr           := address.drop(log2Up(wordBytes)).asUInt
+    writeData.get  := (data << bitOffset).resize(wordBytes * 8 bits)
+    wmask.get      := (~(~B(0, wordBytes bits) |<< byteCount)) |<< byteOffset
   }
 }
 
@@ -188,6 +167,7 @@ class IExContext(cfg: SurovConfig, val id: Int,
   pc.simPublic
   ir.simPublic
   stage.simPublic
+  start.simPublic
 
   val r1 = Reg(UInt(cfg.xlen bits)).simPublic()
   val r2 = Reg(UInt(cfg.xlen bits)).simPublic()
@@ -224,7 +204,8 @@ class IExContext(cfg: SurovConfig, val id: Int,
 
 class Pipeline(val cfg: SurovConfig) {
   val pcBase = Reg(UInt(cfg.xlen bits)) init(0) simPublic
-  val pc2 = Reg(UInt(cfg.xlen bits)).assignDontCare()
+  // Initialize to a defined value to avoid X propagation when idle
+  val pc2 = Reg(UInt(cfg.xlen bits)) init(0) simPublic
   val irBuf = Vec.fill(cfg.issueWidth)(Reg(Bits(cfg.xlen bits))).simPublic
   irBuf(0).init(Opcode.Jal.asBits.resize(32) | 0x1000)
   irBuf.drop(1).foreach(_.init(rv.nop))
@@ -234,21 +215,37 @@ class Pipeline(val cfg: SurovConfig) {
   val stage = Vec.fill(cfg.issueWidth)(Reg(Stage).init(Stage.S1))
   val start = Vec.fill(cfg.issueWidth)(Reg(Bool).init(True))
   val killAfter = B(False, cfg.issueWidth).simPublic
-  val kill  = killAfter.fillDownToLSO.simPublic
-  val regReads = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits).simPublic)
-  val regWrites = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits).simPublic)
-  val regRemReads = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
-  val regRemWrites = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
-  val readScan = Vec(regRemReads.scanLeft(B(0, cfg.regCount bits))(_ | _))
-  val writeScan = Vec(regRemWrites.scanLeft(B(0, cfg.regCount bits))(_ | _)).simPublic
+  val kill  = killAfter.fillDownUntilLSO.simPublic
 
-  val checkOverlap: (Vec[Bits], Vec[Bits]) => Vec[Bool] = {
-    case (access, scan) => Vec(access.zip(scan)
-    .map({ case (a, b) => (a & b).asUInt.clearedLow(1).orR }))
+  val stageReads  = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
+  val stageWrites = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
+  val willRead    = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
+  val willWrite   = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
+  val readScan    = Vec(willRead.scanLeft(B(0, cfg.regCount bits))(_ | _)).simPublic
+  val writeScan   = Vec(willWrite.scanLeft(B(0, cfg.regCount bits))(_ | _)).simPublic
+
+  val stageLoads  = Vec.fill(cfg.issueWidth)(False).simPublic
+  val stageStores = Vec.fill(cfg.issueWidth)(False).simPublic
+  val willLoad    = Vec.fill(cfg.issueWidth)(False).simPublic
+  val willStore   = Vec.fill(cfg.issueWidth)(False).simPublic
+  val loadScan    = Vec(willLoad.scanLeft(False)(_ | _))
+  val storeScan   = Vec(willStore.scanLeft(False)(_ | _))
+
+
+  def checkOverlap[T <: Data with BitwiseOp[T]](access: Vec[T], scan: Vec[T], reduce: T => Bool): Vec[Bool] = {
+    Vec(access.zip(scan)
+    .map({ case (a, b) => reduce(a & b) }))
   }
-  val raw = checkOverlap (regReads, writeScan) simPublic
-  val war = checkOverlap (regWrites, readScan) simPublic
-  val waw = checkOverlap (regWrites, writeScan) simPublic
+  val raw  = checkOverlap (stageReads,  writeScan, (b: Bits) => b.drop(1).orR)
+  val war  = checkOverlap (stageWrites, readScan,  (b: Bits) => b.drop(1).orR)
+  val waw  = checkOverlap (stageWrites, writeScan, (b: Bits) => b.drop(1).orR)
+  val ldst = checkOverlap (stageStores, loadScan,  (b: Bool) => b)
+  val stst = checkOverlap (stageStores, storeScan, (b: Bool) => b)
+  val stld = checkOverlap (stageLoads,  storeScan, (b: Bool) => b)
+  val ldld = checkOverlap (stageLoads,  storeScan, (b: Bool) => b)
+  // load-load is not an issue for single-core.
+  val lsuHazard = (stageLoads | stageStores).asBits.clearLSO.asBools
+  
   val stall = Vec.fill(cfg.issueWidth)(Bool)
   val pipes: IndexedSeq[IExContext] =
     for (i <- 0 until cfg.issueWidth)
@@ -256,10 +253,9 @@ class Pipeline(val cfg: SurovConfig) {
 
   val occupied = Vec(pipes.map(_.stage =/= Stage.S0))
   val alive = occupied & ~kill.asBools
-  stall := alive & (raw | war | waw)
+  stall := alive & (raw | war | waw | ldst | stst | stld | ldld | lsuHazard)
   val active = alive & ~stall
   stall.simPublic
-  alive.simPublic 
   active.simPublic
 
   // for convenience
@@ -267,14 +263,16 @@ class Pipeline(val cfg: SurovConfig) {
   val trap = False #* cfg.issueWidth
 
   val imem = new MemIF(cfg.xlen, cfg.xlen / 8 * cfg.issueWidth, false)
-  val dmem = new MemIF(cfg.xlen, cfg.xlen / 8, true)
+  val dmem = new MemIF(cfg.xlen, cfg.xlen / 8 * cfg.issueWidth, true)
+  // Default: no memory access unless write/readReq sets it
+  imem.valid := False
   dmem.valid := False
   dmem.wren.foreach(_ := False)
 
   val fetchedJump = Reg(Bool) init(False) simPublic
 
   def build(plugins: Seq[InstImpl]) {
-    imem.readReq(pcBase + 4*cfg.issueWidth)
+    when (!fetchedJump) { imem.readReq(pcBase + 4*cfg.issueWidth) }
     for ((c, i) <- pipes.zipWithIndex) {
       when (kill(i)) { _finish(i) }
       when(stage(i) === Stage.S0) (finished(i) := True)
@@ -285,10 +283,14 @@ class Pipeline(val cfg: SurovConfig) {
               for (ss <- List(SoftStage.SoftS1, SoftStage.SoftS2, SoftStage.SoftS3)) {
                 is(ss.harden) {
                   p.getStage(c, ss)
-                  regReads(i) := p.getStageReads(c, ss) & (occupied(i) #* cfg.regCount)
-                  regWrites(i) := p.getStageWrites(c, ss) & (occupied(i) #* cfg.regCount)
-                  regRemReads(i) := p.getReadRem(c, ss) & (occupied(i) #* cfg.regCount)
-                  regRemWrites(i) := p.getWriteRem(c, ss) & (occupied(i) #* cfg.regCount)
+                  stageReads(i)  := p.getStageReads(c, ss)  & (occupied(i) #* cfg.regCount)
+                  stageWrites(i) := p.getStageWrites(c, ss) & (occupied(i) #* cfg.regCount)
+                  willRead(i)    := p.getWillRead(c, ss)    & (occupied(i) #* cfg.regCount)
+                  willWrite(i)   := p.getWillWrite(c, ss)   & (occupied(i) #* cfg.regCount)
+                  stageLoads(i)  := p.getStageLoad(ss)  & occupied(i)
+                  stageStores(i) := p.getStageStore(ss) & occupied(i)
+                  willLoad(i)    := p.getWillLoad(ss)   & occupied(i)
+                  willStore(i)   := p.getWillStore(ss)  & occupied(i)
                 }
               }
             }
@@ -347,7 +349,7 @@ class Pipeline(val cfg: SurovConfig) {
     finished(i) := True
   }
 
-  def finish(i: Int) {
+  def finishIfNotStalled(i: Int) {
     when(~stall(i)) { _finish(i) }
   }
 
@@ -367,7 +369,7 @@ class Pipeline(val cfg: SurovConfig) {
   def take_jump(c: IExContext) {
     jumping := True
     jumped := True
-    finish(c.id)
+    finishIfNotStalled(c.id)
   }
 }
 
@@ -396,15 +398,22 @@ case class Surov3Top(cfg: SurovConfig) extends Component {
   val trap = out Bits(cfg.issueWidth bits)
   trap := core.trap
   val imemIF = new MemIF(cfg.xlen, cfg.xlen/8 * cfg.issueWidth, false)
-  val dmemIF = new MemIF(cfg.xlen, cfg.xlen/8, true)
+  val dmemIF = new MemIF(cfg.xlen, cfg.xlen/8 * cfg.issueWidth, true)
   core.pipeline.imem <> imemIF
   core.pipeline.dmem <> dmemIF
   val rf = Mem(Bits(32 bits), wordCount = cfg.regCount) simPublic;
   for (c <- core.pipeline.pipes) {
-    c.rf1.readData := c.rf1.addr.mux(U(0, log2Up(cfg.regCount) bits) -> B(0, cfg.xlen bits), default -> rf(c.rf1.addr))
+    // Asynchronous read so dependent ops see latest reg value without an extra cycle
+    c.rf1.readData := c.rf1.addr.mux(
+      U(0, log2Up(cfg.regCount) bits) -> B(0, cfg.xlen bits),
+      default -> rf.readAsync(c.rf1.addr)
+    )
     rf.write(c.rf1.addr, c.rf1.writeData, c.rf1.wren)
     if (cfg.enableDualPort) {
-      c.rf2.get.readData := c.rf2.get.addr.mux(U(0, log2Up(cfg.regCount) bits) -> B(0, cfg.xlen bits), default -> rf(c.rf2.get.addr))
+      c.rf2.get.readData := c.rf2.get.addr.mux(
+        U(0, log2Up(cfg.regCount) bits) -> B(0, cfg.xlen bits),
+        default -> rf.readAsync(c.rf2.get.addr)
+      )
       // rf.write(c.rf2.get.addr, c.rf2.get.writeData, c.rf2.get.wren)
     }
   }
@@ -419,8 +428,7 @@ case class SimDUT(cfg: SurovConfig) extends Component {
     address = top.imemIF.addr.resize(14),
     enable = top.imemIF.valid,
   )
-  val dmem = Mem(Bits(cfg.xlen bits), wordCount = 1 << 14).simPublic
-  top.dmemIF.readData := dmem.readWriteSync(
+  top.dmemIF.readData := mem.readWriteSync(
     address = top.dmemIF.addr.resize(14),
     enable = top.dmemIF.valid,
     write = top.dmemIF.wren.get,

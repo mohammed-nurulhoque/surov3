@@ -64,41 +64,45 @@ object Surov3CoreSim extends App {
       while(cycles < maxCycles) {
         dut.clockDomain.waitRisingEdge()
         cycles += 1
-        pw.println(f"[cycle ${cycles}%03d] Pipes state:")
-        pw.println(s"fetchedJump: ${pl.fetchedJump.toBoolean} jumping ${pl.jumping.toBoolean} jumped: ${pl.jumped.toBoolean}")
-        pw.println(s"irLine:       ${pl.irBuf.map(_.toLong.toHexString)}")
-        pw.println(s"ir2:          ${pl.ir2.toBigInt.toString(16)}")
-        pw.println(s"regReads:     ${pl.regReads.map(_.toLong.toBinaryString)}")
-        pw.println(s"regWrites:    ${pl.regWrites.map(_.toLong.toBinaryString)}")
-        pw.println(s"raw:          ${pl.raw.map(_.toBoolean)}")
-        pw.println(s"war:          ${pl.war.map(_.toBoolean)}")
-        pw.println(s"waw:          ${pl.waw.map(_.toBoolean)}")
-        // pw.println(s"regRemReads:  ${pl.regRemReads.map(_.toLong.toBinaryString)}")
-        // pw.println(s"regRemWrites: ${pl.regRemWrites.map(_.toLong.toBinaryString)}")
-        // pw.println(s"readScan:  ${pl.readScan.map(_.toLong.toBinaryString)}")
-        // pw.println(s"writeScan: ${pl.writeScan.map(_.toLong.toBinaryString)}")
-        pw.println(s"stall: ${pl.stall.map(_.toBoolean)}")
-        pw.println(f"kills: ${pl.kill.toInt.toBinaryString}")
+        pw.println(f"[cycle ${cycles}%03d]")
+        val global =
+          f"G fetchedJump=${pl.fetchedJump.toBoolean} jumping=${pl.jumping.toBoolean} jumped=${pl.jumped.toBoolean} " +
+          f"pcBase=${pl.pcBase.toLong}%08x pc2=${pl.pc2.toLong}%08x " +
+          f"irLine=${pl.irBuf.map(_.toLong.toHexString).mkString("[",",","]")} " +
+          f"ir2=${pl.ir2.toBigInt.toString(16)} " +
+          f"stall=${pl.stall.map(_.toBoolean)} kill=${pl.kill.toInt.toBinaryString} " +
+          f"finished=${pl.finished.map(_.toBoolean)}" +
+          f"active=${Vec.fill(4)(False)} " //f"active=${pl.active.map(_.toBoolean)} "
+        pw.println(global)
+        val scans =
+          //f"H readScan=${pl.readScan.map(_.toLong.toBinaryString)} "
+          //f"writeScan=${pl.writeScan.map(_.toLong.toBinaryString)} "
+          // f"willRead=${pl.willRead.map(_.toLong.toBinaryString)} "
+          //f"willWrite=${pl.willWrite.map(_.toLong.toBinaryString)} "
+          f"stageReads=${pl.stageReads.map(_.toLong.toBinaryString)} stageWrites=${pl.stageWrites.map(_.toLong.toBinaryString)} "
+          f"stageLoads=${pl.stageLoads.map(_.toBoolean)} stageStores=${pl.stageStores.map(_.toBoolean)} "
+          //f"willLoad=${pl.willLoad.map(_.toBoolean)}
+          //f"willStore=${pl.willStore.map(_.toBoolean)} "
+        pw.println(scans)
         for (c <- pl.pipes) {
-          pw.println(f"(${c.id}) ${
-            if (pl.finished(c.id).toBoolean) "F" 
-            else if (((pl.kill.toLong >> c.id) & 1) == 1) "K" 
-            else if (pl.stall(c.id).toBoolean) "S" 
-            else " "
-          } ${c.stage.toEnum} pc: ${c.pc.toLong}%08x ir: ${c.ir.toLong}%08x")
+          val line =
+            f"P${c.id} stage=${c.stage.toEnum} start=${pl.start(c.id).toBoolean} " +
+            f"stall=${pl.stall(c.id).toBoolean} kill=${((pl.kill.toLong >> c.id) & 1)==1} finished=${pl.finished(c.id).toBoolean} " +
+            f"pc=${c.pc.toLong}%08x ir=${c.ir.toLong}%08x " +
+            f"r1=${c.r1.toLong}%08x r2=${c.r2.toLong}%08x"
+          pw.println(line)
         }
 
         val sb = new StringBuilder()
-        sb.append("Registers: ")
-        for (i <- 1 to 15) {
-          val regValue = dut.top.rf.getBigInt(i) 
-          sb.append(f"x${i}%02d: ${regValue}%02d ") 
+        sb.append("R ")
+        for (i <- 0 until cfg.regCount) {
+          val regValue = dut.top.rf.getBigInt(i)
+          sb.append(f"x$i%02d:${regValue}%d ")
         }
+        pw.println(sb.toString)
 
-// Print the collected string
-pw.println(sb.toString)
         instsRet += pl.pipes.count(c => pl.stage(c.id).toEnum == Stage.S1 && !pl.stall(c.id).toBoolean && (((pl.kill.toLong >> c.id) & 1) != 1))
-        pw.println(f"InstsRet after: ${instsRet}")
+        pw.println(f"InstsRet=${instsRet}")
         val trap = dut.trap.toInt
         val c = if (trap != 0) pl.pipes(Integer.numberOfTrailingZeros(trap)) else null
         if (trap != 0 && c.stage.toEnum == Stage.S3) {
@@ -173,5 +177,138 @@ pw.println(sb.toString)
       fw.close()
       simFailure(s"Didn't finish after $maxCycles steps")
     }
+  }
+}
+
+// Lightweight interactive TUI to browse the generated log (hw/a.log by default)
+object Surov3TraceTui extends App {
+  case class PipeRow(
+    id: Int,
+    stage: String,
+    start: Boolean,
+    stall: Boolean,
+    kill: Boolean,
+    finished: Boolean,
+    pc: Long,
+    ir: Long,
+    r1: Long,
+    r2: Long
+  )
+  case class Cycle(
+    n: Int,
+    fetchedJump: Boolean,
+    jumping: Boolean,
+    jumped: Boolean,
+    pcBase: Long,
+    pc2: Long,
+    irLine: Seq[String],
+    ir2: String,
+    stall: Seq[Boolean],
+    kill: String,
+    pipes: Seq[PipeRow]
+  )
+
+  val logPath = args.headOption.getOrElse("hw/a.log")
+  val lines = scala.io.Source.fromFile(logPath).getLines().toVector
+
+  // Parse cycles based on the structured log format above
+  val cycles = collection.mutable.ArrayBuffer.empty[Cycle]
+  var idx = 0
+  while (idx < lines.length) {
+    val line = lines(idx)
+    if (line.startsWith("[cycle")) {
+      val cnum = line.drop(7).takeWhile(_.isDigit).toInt
+      val g = lines(idx + 1).split("\\s+").toSeq
+      def gFlag(k: String) = g.find(_.startsWith(k)).map(_.dropWhile(_ != '=').drop(1)).getOrElse("false").toBoolean
+      def gHex(k: String) = java.lang.Long.parseLong(g.find(_.startsWith(k)).map(_.split("=")(1)).getOrElse("0"), 16)
+      val irLineStr = g.find(_.startsWith("irLine=")).getOrElse("irLine=[]")
+      val irLine = irLineStr.dropWhile(_ != '[').drop(1).takeWhile(_ != ']').split(",").filter(_.nonEmpty)
+      val ir2 = g.find(_.startsWith("ir2=")).map(_.split("=")(1)).getOrElse("0")
+      val stallStr = g.find(_.startsWith("stall=")).map(_.split("=")(1)).getOrElse("Vector()")
+      val stalls = stallStr.dropWhile(_ != '(').drop(1).dropRight(1).split(",").toSeq.filter(_.nonEmpty).map(_.toBoolean)
+      val kill = g.find(_.startsWith("kill=")).map(_.split("=")(1)).getOrElse("0")
+      val pipes = collection.mutable.ArrayBuffer.empty[PipeRow]
+      var j = idx + 2
+      while (j < lines.length && lines(j).startsWith("P")) {
+        val parts = lines(j).split("\\s+")
+        def part(k: String) = parts.find(_.startsWith(k)).map(_.split("=")(1)).getOrElse("")
+        pipes += PipeRow(
+          id = parts(0).drop(1).toInt,
+          stage = part("stage"),
+          start = part("start").toBoolean,
+          stall = part("stall").toBoolean,
+          kill = part("kill").toBoolean,
+          finished = part("finished").toBoolean,
+          pc = java.lang.Long.parseLong(part("pc"), 16),
+          ir = java.lang.Long.parseLong(part("ir"), 16),
+          r1 = java.lang.Long.parseLong(part("r1"), 16),
+          r2 = java.lang.Long.parseLong(part("r2"), 16)
+        )
+        j += 1
+      }
+      cycles += Cycle(
+        n = cnum,
+        fetchedJump = gFlag("fetchedJump"),
+        jumping = gFlag("jumping"),
+        jumped = gFlag("jumped"),
+        pcBase = gHex("pcBase"),
+        pc2 = gHex("pc2"),
+        irLine = irLine,
+        ir2 = ir2,
+        stall = stalls,
+        kill = kill,
+        pipes = pipes.toSeq
+      )
+      idx = j
+    } else idx += 1
+  }
+
+  val pcFirst = collection.mutable.HashMap.empty[Long, Int]
+  cycles.foreach { c =>
+    c.pipes.foreach { p =>
+      if (!pcFirst.contains(p.pc)) pcFirst(p.pc) = c.n
+    }
+  }
+
+  var cursor = 0
+  def show(i: Int): Unit = {
+    val c = cycles(i)
+    println(f"[cycle ${c.n}] pcBase=${c.pcBase}%08x pc2=${c.pc2}%08x fetchedJump=${c.fetchedJump} jumping=${c.jumping} jumped=${c.jumped}")
+    println(f"irLine=${c.irLine.mkString("[", ",", "]")} ir2=${c.ir2}")
+    println(f"kill=${c.kill} stall=${c.stall.mkString("[", ",", "]")}")
+    c.pipes.foreach { p =>
+      println(f"P${p.id} ${p.stage} pc=${p.pc}%08x ir=${p.ir}%08x start=${p.start} stall=${p.stall} kill=${p.kill} fin=${p.finished} r1=${p.r1}%08x r2=${p.r2}%08x")
+    }
+  }
+
+  def help(): Unit = {
+    println("Commands: n/next, p/prev, c <num>, pc <hex>, q, h")
+  }
+
+  help()
+  show(cursor)
+  Iterator.continually(scala.io.StdIn.readLine("> ")).takeWhile(_ != null).foreach {
+    case null => ()
+    case s if s == "q" => System.exit(0)
+    case s if s == "n" || s == "next" =>
+      cursor = (cursor + 1).min(cycles.size - 1); show(cursor)
+    case s if s == "p" || s == "prev" =>
+      cursor = (cursor - 1).max(0); show(cursor)
+    case s if s.startsWith("c ") =>
+      val n = s.split("\\s+")(1).toInt
+      cycles.indexWhere(_.n == n) match {
+        case -1 => println(s"cycle $n not found")
+        case idx => cursor = idx; show(cursor)
+      }
+    case s if s.startsWith("pc ") =>
+      val pc = java.lang.Long.parseLong(s.split("\\s+")(1).replace("0x",""), 16)
+      pcFirst.get(pc) match {
+        case Some(n) =>
+          val idx = cycles.indexWhere(_.n == n)
+          if (idx >= 0) { cursor = idx; show(cursor) } else println(s"pc 0x$pc not found in cycles")
+        case None => println(s"pc 0x$pc not found")
+      }
+    case s if s == "h" || s == "help" => help()
+    case other => println(s"unrecognized: $other"); help()
   }
 }
