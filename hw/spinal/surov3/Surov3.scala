@@ -169,6 +169,8 @@ class IExContext(cfg: SurovConfig, val id: Int,
   stage.simPublic
   start.simPublic
 
+  val op = rv.opcode(ir).simPublic
+
   val r1 = Reg(UInt(cfg.xlen bits)).simPublic()
   val r2 = Reg(UInt(cfg.xlen bits)).simPublic()
   val alu = new ALU(cfg.xlen, cfg.regCount)
@@ -221,39 +223,32 @@ class Pipeline(val cfg: SurovConfig) {
   val stageWrites = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
   val willRead    = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
   val willWrite   = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
+
   val readScan    = Vec(willRead.scanLeft(B(0, cfg.regCount bits))(_ | _)).simPublic
   val writeScan   = Vec(willWrite.scanLeft(B(0, cfg.regCount bits))(_ | _)).simPublic
 
-  val stageLoads  = Vec.fill(cfg.issueWidth)(False).simPublic
-  val stageStores = Vec.fill(cfg.issueWidth)(False).simPublic
-  val willLoad    = Vec.fill(cfg.issueWidth)(False).simPublic
-  val willStore   = Vec.fill(cfg.issueWidth)(False).simPublic
-  val loadScan    = Vec(willLoad.scanLeft(False)(_ | _))
-  val storeScan   = Vec(willStore.scanLeft(False)(_ | _))
+  val stageMemX  = Vec.fill(cfg.issueWidth)(False).simPublic
+  val willMemX   = Vec.fill(cfg.issueWidth)(False).simPublic
 
+  val memScan  = Vec(willMemX.scanLeft(False)(_ | _)).simPublic
 
   def checkOverlap[T <: Data with BitwiseOp[T]](access: Vec[T], scan: Vec[T], reduce: T => Bool): Vec[Bool] = {
     Vec(access.zip(scan)
     .map({ case (a, b) => reduce(a & b) }))
   }
-  val raw  = checkOverlap (stageReads,  writeScan, (b: Bits) => b.drop(1).orR)
-  val war  = checkOverlap (stageWrites, readScan,  (b: Bits) => b.drop(1).orR)
-  val waw  = checkOverlap (stageWrites, writeScan, (b: Bits) => b.drop(1).orR)
-  val ldst = checkOverlap (stageStores, loadScan,  (b: Bool) => b)
-  val stst = checkOverlap (stageStores, storeScan, (b: Bool) => b)
-  val stld = checkOverlap (stageLoads,  storeScan, (b: Bool) => b)
-  val ldld = checkOverlap (stageLoads,  storeScan, (b: Bool) => b)
-  // load-load is not an issue for single-core.
-  val lsuHazard = (stageLoads | stageStores).asBits.clearLSO.asBools
+  val raw  = checkOverlap (stageReads,  writeScan, (b: Bits) => b.drop(1).orR).simPublic
+  val war  = checkOverlap (stageWrites, readScan,  (b: Bits) => b.drop(1).orR).simPublic
+  val waw  = checkOverlap (stageWrites, writeScan, (b: Bits) => b.drop(1).orR).simPublic
+  val memDep = checkOverlap (stageMemX,  memScan,   (b: Bool) => b)
   
-  val stall = Vec.fill(cfg.issueWidth)(Bool)
+  val stall = Vec.fill(cfg.issueWidth)(Bool).simPublic()
   val pipes: IndexedSeq[IExContext] =
     for (i <- 0 until cfg.issueWidth)
     yield new IExContext(cfg, i, pcBase + 4*i, irBuf(i), stage(i), start(i), stall(i), kill(i))
 
   val occupied = Vec(pipes.map(_.stage =/= Stage.S0))
   val alive = occupied & ~kill.asBools
-  stall := alive & (raw | war | waw | ldst | stst | stld | ldld | lsuHazard)
+  stall := alive & (raw | war | waw | memDep)
   val active = alive & ~stall
   stall.simPublic
   active.simPublic
@@ -287,10 +282,8 @@ class Pipeline(val cfg: SurovConfig) {
                   stageWrites(i) := p.getStageWrites(c, ss) & (occupied(i) #* cfg.regCount)
                   willRead(i)    := p.getWillRead(c, ss)    & (occupied(i) #* cfg.regCount)
                   willWrite(i)   := p.getWillWrite(c, ss)   & (occupied(i) #* cfg.regCount)
-                  stageLoads(i)  := p.getStageLoad(ss)  & occupied(i)
-                  stageStores(i) := p.getStageStore(ss) & occupied(i)
-                  willLoad(i)    := p.getWillLoad(ss)   & occupied(i)
-                  willStore(i)   := p.getWillStore(ss)  & occupied(i)
+                  stageMemX(i)  := p.getStageMemX(ss) & occupied(i)
+                  willMemX(i)   := p.getWillMemX(ss)  & occupied(i)
                 }
               }
             }

@@ -51,10 +51,8 @@ abstract class InstImpl(p: Pipeline) {
     SoftStage.currentAndFollowing(current).map(ss => getStageWrites(c, ss))
     .fold(NoAccess)(_ | _)
   
-  def getStageLoad(ss: SoftStage) = False
-  def getWillLoad(ss: SoftStage)  = False
-  def getStageStore(ss: SoftStage)= False
-  def getWillStore(ss: SoftStage) = False
+  def getStageMemX(ss: SoftStage) = False
+  def getWillMemX(ss: SoftStage)  = False
 
   final def getStage(c: IExContext, ss: SoftStage) = {
     ss match {
@@ -152,8 +150,8 @@ class LuiImpl(p: Pipeline) extends InstImpl(p) {
 class LoadImpl(p: Pipeline) extends InstImpl(p) {
   override def opcode: Opcode.C = Opcode.Load
   override def getWritesS3(c: IExContext): Bits = B(1) << rv.rd(c.ir)
-  override def getStageLoad(ss: SoftStage): Bool = Bool(ss == SoftS2)
-  override def getWillLoad(ss: SoftStage): Bool = True
+  override def getStageMemX(ss: SoftStage): Bool = Bool(ss == SoftS2)
+  override def getWillMemX(ss: SoftStage): Bool = True
   override def getS2(c: IExContext) = {
     val address = c.add(c.r1, rv.imm_i(c.ir).asUInt)
     c.r1 := address
@@ -171,8 +169,8 @@ class LoadImpl(p: Pipeline) extends InstImpl(p) {
 class StoreImpl(p: Pipeline) extends InstImpl(p) {
   override def opcode: Opcode.C = Opcode.Store
   override def getReadsS2(c: IExContext) = B(1) << rv.rs2(c.ir)
-  override def getStageStore(ss: SoftStage): Bool = Bool(ss == SoftS2)
-  override def getWillStore(ss: SoftStage): Bool = True
+  override def getStageMemX(ss: SoftStage): Bool = Bool(ss == SoftS2)
+  override def getWillMemX(ss: SoftStage): Bool = True
   override def getS2(c: IExContext): Unit = {
     when (~c.stall) {
       p.dmem.write(
@@ -284,8 +282,6 @@ class BranchImpl(p: Pipeline) extends InstImpl(p) {
       when(c.compute(c.r1, c.r2)._1(0)) {
         p.take_jump(c)
       } otherwise {
-        // Branch not taken: cancel the speculative jump fetch
-        p.fetchedJump := False
         p.finishIfNotStalled(c.id)
       }
     }

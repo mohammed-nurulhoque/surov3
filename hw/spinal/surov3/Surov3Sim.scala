@@ -5,9 +5,46 @@ import scala.io.Source
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import scala.util.Try
 import spinal.core._
 import spinal.core.sim._
+import upickle.default._
 
+case class PipeSnap(
+  id: Int,
+  opcode: String,
+  stage: String,
+  start: Boolean,
+  stall: Boolean,
+  kill: Boolean,
+  finished: Boolean,
+  pc: Long,
+  ir: Long,
+  r1: Long,
+  r2: Long
+)
+
+case class CycleSnap(
+  n: Int,
+  fetchedJump: Boolean,
+  jumping: Boolean,
+  jumped: Boolean,
+  pcBase: Long,
+  pc2: Long,
+  irLine: Seq[Long],
+  ir2: Long,
+  stall: Seq[Boolean],
+  kill: Int,
+  finished: Seq[Boolean],
+  pipes: Seq[PipeSnap],
+  regs: Seq[Long],
+  instsRet: Int
+)
+
+object CycleSnap {
+  implicit val pipeRw: ReadWriter[PipeSnap] = macroRW
+  implicit val cycleRw: ReadWriter[CycleSnap] = macroRW
+}
 object Surov3CoreSim extends App {
   // Define Syscall Numbers (Linux/Newlib standard)
   val SYS_EXIT  = 93
@@ -64,45 +101,43 @@ object Surov3CoreSim extends App {
       while(cycles < maxCycles) {
         dut.clockDomain.waitRisingEdge()
         cycles += 1
-        pw.println(f"[cycle ${cycles}%03d]")
-        val global =
-          f"G fetchedJump=${pl.fetchedJump.toBoolean} jumping=${pl.jumping.toBoolean} jumped=${pl.jumped.toBoolean} " +
-          f"pcBase=${pl.pcBase.toLong}%08x pc2=${pl.pc2.toLong}%08x " +
-          f"irLine=${pl.irBuf.map(_.toLong.toHexString).mkString("[",",","]")} " +
-          f"ir2=${pl.ir2.toBigInt.toString(16)} " +
-          f"stall=${pl.stall.map(_.toBoolean)} kill=${pl.kill.toInt.toBinaryString} " +
-          f"finished=${pl.finished.map(_.toBoolean)}" +
-          f"active=${Vec.fill(4)(False)} " //f"active=${pl.active.map(_.toBoolean)} "
-        pw.println(global)
-        val scans =
-          //f"H readScan=${pl.readScan.map(_.toLong.toBinaryString)} "
-          //f"writeScan=${pl.writeScan.map(_.toLong.toBinaryString)} "
-          // f"willRead=${pl.willRead.map(_.toLong.toBinaryString)} "
-          //f"willWrite=${pl.willWrite.map(_.toLong.toBinaryString)} "
-          f"stageReads=${pl.stageReads.map(_.toLong.toBinaryString)} stageWrites=${pl.stageWrites.map(_.toLong.toBinaryString)} "
-          f"stageLoads=${pl.stageLoads.map(_.toBoolean)} stageStores=${pl.stageStores.map(_.toBoolean)} "
-          //f"willLoad=${pl.willLoad.map(_.toBoolean)}
-          //f"willStore=${pl.willStore.map(_.toBoolean)} "
-        pw.println(scans)
-        for (c <- pl.pipes) {
-          val line =
-            f"P${c.id} stage=${c.stage.toEnum} start=${pl.start(c.id).toBoolean} " +
-            f"stall=${pl.stall(c.id).toBoolean} kill=${((pl.kill.toLong >> c.id) & 1)==1} finished=${pl.finished(c.id).toBoolean} " +
-            f"pc=${c.pc.toLong}%08x ir=${c.ir.toLong}%08x " +
-            f"r1=${c.r1.toLong}%08x r2=${c.r2.toLong}%08x"
-          pw.println(line)
-        }
 
-        val sb = new StringBuilder()
-        sb.append("R ")
-        for (i <- 0 until cfg.regCount) {
-          val regValue = dut.top.rf.getBigInt(i)
-          sb.append(f"x$i%02d:${regValue}%d ")
-        }
-        pw.println(sb.toString)
+        val pipesSnap = pl.pipes.map { c =>
+          PipeSnap(
+            id = c.id,
+            opcode = "???", // c.op.toEnum.toString
+            stage = c.stage.toEnum.toString,
+            start = pl.start(c.id).toBoolean,
+            stall = pl.stall(c.id).toBoolean,
+            kill = (((pl.kill.toLong >> c.id) & 1) == 1),
+            finished = pl.finished(c.id).toBoolean,
+            pc = c.pc.toLong,
+            ir = c.ir.toLong,
+            r1 = c.r1.toLong,
+            r2 = c.r2.toLong
+          )
+        }.toSeq
 
         instsRet += pl.pipes.count(c => pl.stage(c.id).toEnum == Stage.S1 && !pl.stall(c.id).toBoolean && (((pl.kill.toLong >> c.id) & 1) != 1))
-        pw.println(f"InstsRet=${instsRet}")
+
+        val cycleSnap = CycleSnap(
+          n = cycles,
+          fetchedJump = pl.fetchedJump.toBoolean,
+          jumping = pl.jumping.toBoolean,
+          jumped = pl.jumped.toBoolean,
+          pcBase = pl.pcBase.toLong,
+          pc2 = pl.pc2.toLong,
+          irLine = pl.irBuf.map(_.toLong).toSeq,
+          ir2 = pl.ir2.toBigInt.longValue,
+          stall = pl.stall.map(_.toBoolean).toSeq,
+          kill = pl.kill.toInt,
+          finished = pl.finished.map(_.toBoolean).toSeq,
+          pipes = pipesSnap,
+          regs = (0 until cfg.regCount).map(i => dut.top.rf.getBigInt(i).toLong).toSeq,
+          instsRet = instsRet
+        )
+
+        pw.println(write(cycleSnap))
         val trap = dut.trap.toInt
         val c = if (trap != 0) pl.pipes(Integer.numberOfTrailingZeros(trap)) else null
         if (trap != 0 && c.stage.toEnum == Stage.S3) {
@@ -182,86 +217,23 @@ object Surov3CoreSim extends App {
 
 // Lightweight interactive TUI to browse the generated log (hw/a.log by default)
 object Surov3TraceTui extends App {
-  case class PipeRow(
-    id: Int,
-    stage: String,
-    start: Boolean,
-    stall: Boolean,
-    kill: Boolean,
-    finished: Boolean,
-    pc: Long,
-    ir: Long,
-    r1: Long,
-    r2: Long
-  )
-  case class Cycle(
-    n: Int,
-    fetchedJump: Boolean,
-    jumping: Boolean,
-    jumped: Boolean,
-    pcBase: Long,
-    pc2: Long,
-    irLine: Seq[String],
-    ir2: String,
-    stall: Seq[Boolean],
-    kill: String,
-    pipes: Seq[PipeRow]
-  )
-
   val logPath = args.headOption.getOrElse("hw/a.log")
-  val lines = scala.io.Source.fromFile(logPath).getLines().toVector
+  // Keep only non-empty JSON-looking lines; ignore trap/status text.
+  val lines = scala.io.Source.fromFile(logPath).getLines().filter(_.trim.startsWith("{")).toVector
+  println(s"[TUI] Read ${lines.length} JSON-like lines from $logPath")
 
-  // Parse cycles based on the structured log format above
-  val cycles = collection.mutable.ArrayBuffer.empty[Cycle]
-  var idx = 0
-  while (idx < lines.length) {
-    val line = lines(idx)
-    if (line.startsWith("[cycle")) {
-      val cnum = line.drop(7).takeWhile(_.isDigit).toInt
-      val g = lines(idx + 1).split("\\s+").toSeq
-      def gFlag(k: String) = g.find(_.startsWith(k)).map(_.dropWhile(_ != '=').drop(1)).getOrElse("false").toBoolean
-      def gHex(k: String) = java.lang.Long.parseLong(g.find(_.startsWith(k)).map(_.split("=")(1)).getOrElse("0"), 16)
-      val irLineStr = g.find(_.startsWith("irLine=")).getOrElse("irLine=[]")
-      val irLine = irLineStr.dropWhile(_ != '[').drop(1).takeWhile(_ != ']').split(",").filter(_.nonEmpty)
-      val ir2 = g.find(_.startsWith("ir2=")).map(_.split("=")(1)).getOrElse("0")
-      val stallStr = g.find(_.startsWith("stall=")).map(_.split("=")(1)).getOrElse("Vector()")
-      val stalls = stallStr.dropWhile(_ != '(').drop(1).dropRight(1).split(",").toSeq.filter(_.nonEmpty).map(_.toBoolean)
-      val kill = g.find(_.startsWith("kill=")).map(_.split("=")(1)).getOrElse("0")
-      val pipes = collection.mutable.ArrayBuffer.empty[PipeRow]
-      var j = idx + 2
-      while (j < lines.length && lines(j).startsWith("P")) {
-        val parts = lines(j).split("\\s+")
-        def part(k: String) = parts.find(_.startsWith(k)).map(_.split("=")(1)).getOrElse("")
-        pipes += PipeRow(
-          id = parts(0).drop(1).toInt,
-          stage = part("stage"),
-          start = part("start").toBoolean,
-          stall = part("stall").toBoolean,
-          kill = part("kill").toBoolean,
-          finished = part("finished").toBoolean,
-          pc = java.lang.Long.parseLong(part("pc"), 16),
-          ir = java.lang.Long.parseLong(part("ir"), 16),
-          r1 = java.lang.Long.parseLong(part("r1"), 16),
-          r2 = java.lang.Long.parseLong(part("r2"), 16)
-        )
-        j += 1
-      }
-      cycles += Cycle(
-        n = cnum,
-        fetchedJump = gFlag("fetchedJump"),
-        jumping = gFlag("jumping"),
-        jumped = gFlag("jumped"),
-        pcBase = gHex("pcBase"),
-        pc2 = gHex("pc2"),
-        irLine = irLine,
-        ir2 = ir2,
-        stall = stalls,
-        kill = kill,
-        pipes = pipes.toSeq
-      )
-      idx = j
-    } else idx += 1
+  def parseCycle(line: String): Option[CycleSnap] =
+    Try {
+      read[CycleSnap](line)
+    }.toOption
+
+  val cycles = lines.zipWithIndex.flatMap { case (ln, idx) =>
+    parseCycle(ln).orElse {
+      println(s"[TUI] Parse failed at line $idx: $ln")
+      None
+    }
   }
+  println(s"[TUI] Parsed ${cycles.length} cycles")
 
   val pcFirst = collection.mutable.HashMap.empty[Long, Int]
   cycles.foreach { c =>
@@ -272,10 +244,11 @@ object Surov3TraceTui extends App {
 
   var cursor = 0
   def show(i: Int): Unit = {
+    if (cycles.isEmpty) { println("No cycles parsed."); return }
     val c = cycles(i)
     println(f"[cycle ${c.n}] pcBase=${c.pcBase}%08x pc2=${c.pc2}%08x fetchedJump=${c.fetchedJump} jumping=${c.jumping} jumped=${c.jumped}")
     println(f"irLine=${c.irLine.mkString("[", ",", "]")} ir2=${c.ir2}")
-    println(f"kill=${c.kill} stall=${c.stall.mkString("[", ",", "]")}")
+    println(f"kill=${c.kill.toBinaryString} stall=${c.stall.mkString("[", ",", "]")} finished=${c.finished.mkString("[", ",", "]")}")
     c.pipes.foreach { p =>
       println(f"P${p.id} ${p.stage} pc=${p.pc}%08x ir=${p.ir}%08x start=${p.start} stall=${p.stall} kill=${p.kill} fin=${p.finished} r1=${p.r1}%08x r2=${p.r2}%08x")
     }
