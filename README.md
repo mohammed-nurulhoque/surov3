@@ -8,28 +8,32 @@ SuroV3 introduces a thin abstraction layer for the instruction definitions (Chec
 
 ## Current Status
 
-rv32i but without load/store. Load/store were working before I implemnted superscalar (commit 24fee6e5c6). Didn't fix it yet.
+RV32I with Zicntr (cycle/instret counters). Runs Dhrystone benchmark.
 
-**Parameters**: Currently supports enableDualPort and issueWidth
+**Parameters**: `issueWidth` (1, 2, 4) and `enableDualPort` (single/dual register file ports)
 
-matmul.s is a kernel that computes 2x2 x 2x2 distance product. Tested 1, 2 & 4 issueWidth and single/dual port
+### Dhrystone Benchmark Results
 
+| Width | RF Ports | CPI | DMIPS/MHz |
+|-------|----------|-----|-----------|
+| 1 | Single | 2.485 | 0.528 |
+| 1 | Dual | 2.344 | 0.560 |
+| 2 | Single | 1.933 | 0.678 |
+| 2 | Dual | 1.813 | 0.723 |
+| 4 | Single | 1.655 | 0.793 |
+| 4 | Dual | 1.540 | 0.852 |
 
-| Width | Dual-port | kGE | Cycles |
-| ---- | --- |--- | --- |
-| 1 | No | 5.5 | 96 |
-| 1 | Yes | 6.8 | 81
-| 2 | No | 10  | 70 |
-| 2 | Yes | 11 |  59 |
-| 4 | No | 20  | 62 |
+*Note: Compiled with standard `-O3 -fno-inline` without tuning for issue width. Better ILP extraction expected with unrolling and scheduling optimizations.*
 
 ## Building and Simulation
 
-**Prerequisites**: SpinalHDL. The repo forks [SpinalHDL Base Project](https://github.com/SpinalHDL/SpinalTemplateSbt.git). Follow its instruction to setup the environment
+**Prerequisites**: SpinalHDL. The repo forks [SpinalHDL Base Project](https://github.com/SpinalHDL/SpinalTemplateSbt.git). Follow its instruction to setup the environment.
 
-**Simulation Requirements**: The core's testbench/simulation object expects a binary at `hw/a.bin` which has entry at 0x1000.
+**Simulation**: `Surov3CoreSim` takes ELF executables as arguments (`hw/a.out` by default), converts them to binary, and runs the simulation. Generates a JSON log file (e.g., `hw/a.log`) with per-cycle snapshots.
 
-**System Calls** The sim script simulates exit and write syscalls with codes 93 and 64. The syscall number is held at *a5* (Not a7 as is usual)
+**Trace Viewer**: `Surov3TraceTui` is an interactive TUI that consumes the log file `hw/a.log` to browse cycle-by-cycle pipeline state.
+
+**System Calls**: The simulator handles `exit` (93) and `write` (64) syscalls. The syscall number is in `a5` (not `a7` as usual).
 
 
 ## 📝 TODO

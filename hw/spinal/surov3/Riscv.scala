@@ -46,4 +46,15 @@ object rv {
   def  F3_AND     = B"111"
   def  F3_SLL     = B"001"
   def  F3_SR      = B"101"
+
+  // CSR address (bits 31:20 of I-type immediate)
+  def csr(ir: Bits): UInt = ir(31 downto 20).asUInt
+
+  // Zicntr CSR addresses
+  val CSR_CYCLE    = 0xC00
+  val CSR_TIME     = 0xC01
+  val CSR_INSTRET  = 0xC02
+  val CSR_CYCLEH   = 0xC80
+  val CSR_TIMEH    = 0xC81
+  val CSR_INSTRETH = 0xC82
 }

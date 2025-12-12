@@ -1,10 +1,7 @@
 package surov3
 
 import java.io._
-import scala.io.Source
 import java.io.FileInputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import scala.util.Try
 import spinal.core._
 import spinal.core.sim._
@@ -18,6 +15,7 @@ case class PipeSnap(
   stall: Boolean,
   kill: Boolean,
   finished: Boolean,
+  trap: Boolean,
   pc: Long,
   ir: Long,
   r1: Long,
@@ -29,15 +27,12 @@ case class CycleSnap(
   fetchedJump: Boolean,
   jumping: Boolean,
   jumped: Boolean,
+  jumpPipeIdx: Int,
   pcBase: Long,
   pc2: Long,
-  irLine: Seq[Long],
   ir2: Long,
-  stall: Seq[Boolean],
-  kill: Int,
-  finished: Seq[Boolean],
   pipes: Seq[PipeSnap],
-  regs: Seq[Long],
+  var regs: Seq[Long],
   instsRet: Int
 )
 
@@ -45,173 +40,224 @@ object CycleSnap {
   implicit val pipeRw: ReadWriter[PipeSnap] = macroRW
   implicit val cycleRw: ReadWriter[CycleSnap] = macroRW
 }
+
 object Surov3CoreSim extends App {
-  // Define Syscall Numbers (Linux/Newlib standard)
+  import scala.util.control.Breaks._
+  import sys.process._
+
   val SYS_EXIT  = 93
   val SYS_WRITE = 64
-
-  val maxCycles = 1000 // Safety timeout
+  val maxCycles = 200000
   val baseAddr = 0x1000
-  val binFiles = if (args.isEmpty) Array("hw/a.bin") else args
   val cfg = SurovConfig()
 
-    val fw = new FileWriter("hw/a.log", false)
-    val pw = new PrintWriter(fw)
+  // Convert ELF to binary, returns path to bin
+  def elf2bin(elf: String): String = {
+    val bin = "hw/a.bin"
+    val cmd = s"riscv64-unknown-elf-objcopy -O binary $elf $bin"
+    println(s"Running: $cmd")
+    require(cmd.! == 0, s"objcopy failed for $elf")
+    bin
+  }
+
+  val elfFiles = if (args.isEmpty) Array("hw/a.out") else args
+
+  // Fallback opcode lookup using low 7 bits of the instruction.
+  private val opcodeNames: Map[Int, String] = Map(
+    0x33 -> "Op",
+    0x13 -> "OpImm",
+    0x17 -> "Auipc",
+    0x37 -> "Lui",
+    0x03 -> "Load",
+    0x23 -> "Store",
+    0x63 -> "Branch",
+    0x6f -> "Jal",
+    0x67 -> "Jalr",
+    0x0f -> "Fence",
+    0x73 -> "Sys"
+  )
+
+  private def opcodeName(ir: Long): String =
+    opcodeNames.getOrElse((ir & 0x7fL).toInt, "???")
+
+  // Result tracking for multiple files
+  sealed trait RunResult
+  case class Success(file: String, instsRet: Int, cycles: Int, exitCode: Long) extends RunResult
+  case class Failure(file: String, reason: String) extends RunResult
 
   Config.sim.withWave.noOptimisation.compile(SimDUT(cfg)).doSim { dut =>
     val pl = dut.top.core.pipeline
-    // --- Load Instructions from program.bin ---
-    for (binFilePath <- binFiles) {
-      val fis = new FileInputStream(binFilePath)
-      val buffer = new Array[Byte](cfg.issueWidth * 4) // Read 4 bytes at a time for 32-bit words
+    var results = List.empty[RunResult]
+
+    // Fork a process to generate the clock - runs for entire simulation
+    fork {
+      while (true) {
+        dut.clockDomain.clockToggle()
+        sleep(5)
+      }
+    }
+
+    for (elfPath <- elfFiles) {
+      val binPath = elf2bin(elfPath)
+      val logPath = elfPath.replaceAll("\\.(elf|out)$", "") + ".log"
+      val fw = new FileWriter(logPath, false)
+      val pw = new PrintWriter(fw)
+
+      // Reset the core first
+      dut.clockDomain.assertReset()
+      dut.clockDomain.waitRisingEdge(2)
+      dut.clockDomain.deassertReset()
+
+      val fis = new FileInputStream(binPath)
+      val buffer = new Array[Byte](cfg.issueWidth * 4)
       
-      dut.mem.setBigInt(0, 0)
+      // Clear memory and load new program
+      for (i <- 0 until 16384) dut.mem.setBigInt(i, 0)
       var wordsLoaded = baseAddr / (4 * cfg.issueWidth)
-      println(s"Loading instructions from $binFilePath...")
+      println(s"\n=== Running $elfPath ===")
       while (fis.read(buffer) != -1) {
         dut.mem.setBigInt(address = wordsLoaded, data = BigInt(0.toByte +: buffer.reverse))
         wordsLoaded += 1
       }
       fis.close()
       println(s"Instruction memory loaded successfully: $wordsLoaded words.")
-      // --- End Load Instructions ---
 
-      // Fork a process to generate the reset and the clock on the dut
-      fork {
-        dut.clockDomain.assertReset()
-        for (i <- 0 to 10) {
-          dut.clockDomain.clockToggle()
-          sleep(5)
-        }
-        dut.clockDomain.deassertReset()
-        while(true) {
-          dut.clockDomain.clockToggle()
-          sleep(5)
-        }
-      }
-
-      // Wait a rising edge on the clock
-      dut.clockDomain.waitRisingEdge(6)
-      println(f"first word: ${dut.mem.getBigInt(0x100)}%x")
-      assert(!pl.pipes.exists(c => c.stage.toEnum != Stage.S1))
-
-      // 4. Main Simulation Loop
       var cycles = 0
       var instsRet = 0
-      while(cycles < maxCycles) {
-        dut.clockDomain.waitRisingEdge()
-        cycles += 1
+      var runDone = false
+      var runResult: RunResult = Failure(elfPath, "Unknown error")
 
-        val pipesSnap = pl.pipes.map { c =>
-          PipeSnap(
-            id = c.id,
-            opcode = "???", // c.op.toEnum.toString
-            stage = c.stage.toEnum.toString,
-            start = pl.start(c.id).toBoolean,
-            stall = pl.stall(c.id).toBoolean,
-            kill = (((pl.kill.toLong >> c.id) & 1) == 1),
-            finished = pl.finished(c.id).toBoolean,
-            pc = c.pc.toLong,
-            ir = c.ir.toLong,
-            r1 = c.r1.toLong,
-            r2 = c.r2.toLong
-          )
-        }.toSeq
-
-        instsRet += pl.pipes.count(c => pl.stage(c.id).toEnum == Stage.S1 && !pl.stall(c.id).toBoolean && (((pl.kill.toLong >> c.id) & 1) != 1))
-
-        val cycleSnap = CycleSnap(
-          n = cycles,
-          fetchedJump = pl.fetchedJump.toBoolean,
-          jumping = pl.jumping.toBoolean,
-          jumped = pl.jumped.toBoolean,
-          pcBase = pl.pcBase.toLong,
-          pc2 = pl.pc2.toLong,
-          irLine = pl.irBuf.map(_.toLong).toSeq,
-          ir2 = pl.ir2.toBigInt.longValue,
-          stall = pl.stall.map(_.toBoolean).toSeq,
-          kill = pl.kill.toInt,
-          finished = pl.finished.map(_.toBoolean).toSeq,
-          pipes = pipesSnap,
-          regs = (0 until cfg.regCount).map(i => dut.top.rf.getBigInt(i).toLong).toSeq,
-          instsRet = instsRet
-        )
-
-        pw.println(write(cycleSnap))
-        val trap = dut.trap.toInt
-        val c = if (trap != 0) pl.pipes(Integer.numberOfTrailingZeros(trap)) else null
-        if (trap != 0 && c.stage.toEnum == Stage.S3) {
-          val pc = c.pc.toLong
-          val ir = c.ir.toBigInt // The instruction causing the trap
+      breakable {
+        while (cycles < maxCycles && !runDone) {
+          val trapBits = dut.trap.toLong
+          val pipesSnap = pl.pipes.map { c =>
+            PipeSnap(
+              id = c.id,
+              opcode = opcodeName(c.ir.toLong),
+              stage = c.stage.toEnum.toString,
+              start = pl.start(c.id).toBoolean,
+              stall = pl.stall(c.id).toBoolean,
+              kill = (((pl.kill.toLong >> c.id) & 1) == 1),
+              finished = pl.finished(c.id).toBoolean,
+              trap = ((trapBits >> c.id) & 1) == 1,
+              pc = c.pc.toLong,
+              ir = c.ir.toLong,
+              r1 = c.r1.toLong,
+              r2 = c.r2.toLong
+            )
+          }.toSeq
           
-          // Retrieve register values needed for arguments
-          val a0 = dut.top.rf.getBigInt(10)
-          val a1 = dut.top.rf.getBigInt(11)
-          val a2 = dut.top.rf.getBigInt(12)
-          val a5 = dut.top.rf.getBigInt(15) // Syscall ID
+          instsRet += pl.pipes.count(c => pl.stage(c.id).toEnum == Stage.S1 && !pl.stall(c.id).toBoolean && (((pl.kill.toLong >> c.id) & 1) != 1))
 
-          // Match instruction patterns
-          if (ir == 0x73) { // ECALL
-            a5.toLong match {
-              case SYS_EXIT =>
-                val exitCode = a0.toLong
-                pw.println(f"Completed $instsRet instructions in $cycles Cycles")
-                pw.println(f"EXIT STATUS: $exitCode")
-                pw.close()
-                fw.close()
-                simSuccess()
+          var cycleSnap = CycleSnap(
+            n = cycles,
+            fetchedJump = pl.fetchedJump.toBoolean,
+            jumping = pl.jumping.toBoolean,
+            jumped = pl.jumped.toBoolean,
+            jumpPipeIdx = pl.jumpPipeIdx.toInt,
+            pcBase = pl.pcBase.toLong,
+            pc2 = pl.pc2.toLong,
+            ir2 = pl.ir2.toBigInt.longValue,
+            pipes = pipesSnap,
+            regs = Seq.empty,
+            instsRet = instsRet
+          )
 
-              case SYS_WRITE =>
-                val sb = new StringBuilder()
+          dut.clockDomain.waitRisingEdge()
+          cycles += 1
 
-                // Iterate through the bytes we need to print
-                for (i <- 0 until a2.toInt) {
-                  val currentAddr = a1 + i
-                  val wordData = dut.mem.getBigInt(currentAddr / 4 toLong) 
-                  val byteOffset = (currentAddr % 4) * 8
-                  val charVal    = ((wordData >> byteOffset.toInt) & 0xFF).toByte.toChar
-                  sb.append(charVal)
-                }
+          cycleSnap.regs = (0 until cfg.regCount).map(i => dut.top.rf.getBigInt(i).toLong).toSeq
+          pw.println(write(cycleSnap))
 
-                print(sb.toString)
+          val trap = dut.trap.toInt
+          val c = if (trap != 0) pl.pipes(Integer.numberOfTrailingZeros(trap)) else null
+          if (trap != 0 && c.stage.toEnum == Stage.S1 && !c.stall.toBoolean) {
+            val pc = c.pc.toLong
+            val ir = c.ir.toBigInt
 
-              case _ =>
-                pw.println(f"Unhandled Syscall #$a5 at PC: $pc%08x")
-                pw.close()
-                fw.close()
-                simFailure()
+            val a0 = dut.top.rf.getBigInt(10)
+            val a1 = dut.top.rf.getBigInt(11)
+            val a2 = dut.top.rf.getBigInt(12)
+            val a5 = dut.top.rf.getBigInt(15)
+
+            if (ir == 0x73) { // ECALL
+              a5.toLong match {
+                case SYS_EXIT =>
+                  val exitCode = a0.toLong
+                  println(f"Completed $instsRet instructions in $cycles Cycles")
+                  println(f"EXIT STATUS: $exitCode")
+                  runResult = Success(elfPath, instsRet, cycles, exitCode)
+                  runDone = true
+
+                case SYS_WRITE =>
+                  val sb = new StringBuilder()
+                  val lineSize = cfg.issueWidth * 4  // 16 bytes per line
+                  for (i <- 0 until a2.toInt) {
+                    val currentAddr = (a1 + i).toLong
+                    val lineAddr = currentAddr / lineSize
+                    val byteOffset = (currentAddr % lineSize).toInt
+                    val lineData = dut.mem.getBigInt(lineAddr)
+                    val charVal = ((lineData >> (byteOffset * 8)) & 0xFF).toByte.toChar
+                    sb.append(charVal)
+                  }
+                  print(sb.toString)
+
+                case _ =>
+                  println(f"Unhandled Syscall #$a5 at PC: $pc%08x")
+                  runResult = Failure(elfPath, f"Unhandled Syscall #$a5")
+                  runDone = true
+              }
             }
-          } 
-          else if ((ir & 0x2073) == 0x2073) {
-
-            // Match the specific CSR address
-            val dataToWrite = (ir >> 20 & 0xFFF).toInt match {
-              case 0xC00 => cycles
-              case 0xC02 => instsRet
-              case _ =>
-                // Default case: Unhandled CSR
-                pw.println(f"ERROR: Unhandled CSR read at PC: $pc%08x")
-                pw.close()
-                fw.close()
-                simFailure() // <-- SIMULATION FAILURE ON UNHANDLED CSR
+            else if ((ir & 0x2073) == 0x2073) {
+              val dataToWrite = (ir >> 20 & 0xFFF).toInt match {
+                case 0xC00 => cycles
+                case 0xC02 => instsRet
+                case csr =>
+                  println(f"ERROR: Unhandled CSR 0x$csr%03x at PC: $pc%08x")
+                  runResult = Failure(elfPath, f"Unhandled CSR 0x$csr%03x")
+                  runDone = true
+                  0
+              }
+              if (!runDone) dut.top.rf.setBigInt(ir.toLong >> 7 & 0x1F, dataToWrite)
             }
-            dut.top.rf.setBigInt(ir.toLong >> 7 & 0x1F, dataToWrite)
-          } 
-          else if ((ir & 0x7F) == 0x0F) { // Opcode 0x0F is FENCE
-            // Fence Logic placeholder
-          } 
-          else {
-            pw.println(f"Unrecognized TRAP op $ir%08x at PC: $pc%08x")
-            pw.close()
-            fw.close()
-            simFailure()
+            else if ((ir & 0x7F) == 0x0F) {
+              // FENCE - no-op
+            }
+            else {
+              println(f"Unrecognized TRAP op $ir%08x at PC: $pc%08x")
+              runResult = Failure(elfPath, f"Unrecognized TRAP op $ir%08x")
+              runDone = true
+            }
           }
         }
       }
+
       pw.close()
       fw.close()
-      simFailure(s"Didn't finish after $maxCycles steps")
+
+      if (!runDone) {
+        runResult = Failure(elfPath, s"Timeout after $maxCycles cycles")
+        println(s"TIMEOUT: $elfPath didn't finish after $maxCycles cycles")
+      }
+      results = results :+ runResult
     }
+
+    // Print summary
+    println("\n" + "=" * 60)
+    println("SIMULATION SUMMARY")
+    println("=" * 60)
+    var allSuccess = true
+    results.foreach {
+      case Success(file, insts, cyc, exit) =>
+        println(f"✓ $file: $insts insts, $cyc cycles, exit=$exit")
+        if (exit != 0) allSuccess = false
+      case Failure(file, reason) =>
+        println(f"✗ $file: $reason")
+        allSuccess = false
+    }
+    println("=" * 60)
+
+    if (allSuccess) simSuccess() else simFailure("Some tests failed")
   }
 }
 
@@ -246,16 +292,51 @@ object Surov3TraceTui extends App {
   def show(i: Int): Unit = {
     if (cycles.isEmpty) { println("No cycles parsed."); return }
     val c = cycles(i)
-    println(f"[cycle ${c.n}] pcBase=${c.pcBase}%08x pc2=${c.pc2}%08x fetchedJump=${c.fetchedJump} jumping=${c.jumping} jumped=${c.jumped}")
-    println(f"irLine=${c.irLine.mkString("[", ",", "]")} ir2=${c.ir2}")
-    println(f"kill=${c.kill.toBinaryString} stall=${c.stall.mkString("[", ",", "]")} finished=${c.finished.mkString("[", ",", "]")}")
-    c.pipes.foreach { p =>
-      println(f"P${p.id} ${p.stage} pc=${p.pc}%08x ir=${p.ir}%08x start=${p.start} stall=${p.stall} kill=${p.kill} fin=${p.finished} r1=${p.r1}%08x r2=${p.r2}%08x")
+    val ir2Masked    = BigInt(c.ir2 & 0xffffffffffffffffL)
+    val digits       = math.max(8, ((ir2Masked.bitLength max 32) + 3) / 4)
+    val ir2HexPadded = {
+      val s = ir2Masked.toString(16)
+      ("0" * (digits - s.length)) + s
     }
+    val ir2Chunks = ir2HexPadded.grouped(8).mkString("[", ", ", "]")
+
+    println(f"[cycle ${c.n}] pcBase=${c.pcBase}%08x pc2=${c.pc2}%08x fetchedJump=${c.fetchedJump} jumping=${c.jumping} jumped=${c.jumped} jumpPipeIdx=${c.jumpPipeIdx} instsRet=${c.instsRet} ir2=${ir2Chunks}")
+
+    def pipeBox(p: PipeSnap): (Seq[String], String) = {
+      def b(v: Boolean) = if (v) "✓" else "✗"
+      val header   = f"P${p.id} | ${p.stage} | ${p.opcode}"
+      val pcLine   = f"pc=${p.pc}%08x"
+      val irLine   = f"ir=${p.ir}%08x"
+      val status   = f"start=${b(p.start)} stall=${b(p.stall)} kill=${b(p.kill)} fin=${b(p.finished)} trap=${b(p.trap)}"
+      val regsLine = f"r1=${p.r1}%08x r2=${p.r2}%08x"
+      val lines    = Seq(header, pcLine, irLine, status, regsLine)
+      val width    = lines.map(_.length).max
+      val border   = "+" + ("-" * (width + 2)) + "+"
+      def row(text: String) = "| " + text + (" " * (width - text.length)) + " |"
+      (border +: lines.map(row), border)
+    }
+
+    val boxes = c.pipes.map(pipeBox)
+    val combinedLines = boxes.zipWithIndex.flatMap { case ((boxLines, border), idx) =>
+      if (idx == boxes.size - 1) boxLines :+ border else boxLines
+    }
+    println(combinedLines.mkString("\n"))
+  }
+
+  def showRegs(i: Int): Unit = {
+    if (cycles.isEmpty) { println("No cycles parsed."); return }
+    val regs = cycles(i).regs
+    val rows = regs.grouped(4).zipWithIndex.map { case (g, row) =>
+      g.zipWithIndex.map { case (v, idx) =>
+        val regIdx = row * 4 + idx
+        f"x$regIdx%02d=0x${v & 0xffffffffffffffffL}%08x" // assume rv32
+      }.mkString(" ")
+    }
+    println(rows.mkString("\n"))
   }
 
   def help(): Unit = {
-    println("Commands: n/next, p/prev, c <num>, pc <hex>, q, h")
+    println("Commands: n/next, p/prev, c <num>, pc <hex>, r/regs, q, h")
   }
 
   help()
@@ -281,6 +362,8 @@ object Surov3TraceTui extends App {
           if (idx >= 0) { cursor = idx; show(cursor) } else println(s"pc 0x$pc not found in cycles")
         case None => println(s"pc 0x$pc not found")
       }
+    case s if s == "r" || s == "regs" =>
+      showRegs(cursor)
     case s if s == "h" || s == "help" => help()
     case other => println(s"unrecognized: $other"); help()
   }

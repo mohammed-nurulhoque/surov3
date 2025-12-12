@@ -3,12 +3,12 @@ package surov3
 import spinal.core._
 import spinal.core.sim._
 import surov3.Utils._
+import surov3.SoftStage.SoftS1
 
 case class SurovConfig(
   regCount: Int = 32,
   enableDualPort: Boolean = false,
-  // enableZba: Boolean = false,
-  issueWidth: Int = 4,
+  issueWidth: Int = 8,
   enableForward: Boolean = false,
   xlen: Int = 32,
 )
@@ -27,7 +27,7 @@ class RFIF(xlen: Int, regCount: Int) extends Bundle {
   
   def write(c: IExContext, regnum: UInt, value: Bits) {
     addr := regnum
-    wren := ~c.stall & ~c.kill
+    wren := True
     writeData := value
   }
 }
@@ -72,7 +72,8 @@ class MemIF(val xlen: Int, val wordBytes: Int, val writable: Boolean) extends Bu
         val bitOffset    = byteOffset << 3
         val shiftedData  = readData |>> bitOffset
         val logbyteCount = f3.dropHigh(1).asUInt
-        val byteCount    = U(1, log2Up(wordBytes) bits) |<< logbyteCount
+        // +1 bit to avoid overflow (e.g., 1 << 2 = 4 needs 3 bits)
+        val byteCount    = U(1, log2Up(wordBytes).max(3) bits) |<< logbyteCount
 
         // Build a contiguous bitmask (little-endian) for the requested byte/half/word
         val bitmask = ~(~B(0, wordBytes * 8 bits) |<< (byteCount << 3))
@@ -102,7 +103,8 @@ class MemIF(val xlen: Int, val wordBytes: Int, val writable: Boolean) extends Bu
     val byteOffset  = address(0, log2Up(wordBytes) bits)
     val bitOffset   = byteOffset << 3
     val logbyteCount= funct3.dropHigh(1).asUInt
-    val byteCount   = U(1, log2Up(wordBytes) bits) |<< logbyteCount
+    // +1 bit to avoid overflow (e.g., 1 << 2 = 4 needs 3 bits)
+    val byteCount   = U(1, log2Up(wordBytes) + 1 bits) |<< logbyteCount
     valid          := True
     wren.get       := True
     addr           := address.drop(log2Up(wordBytes)).asUInt
@@ -205,56 +207,64 @@ class IExContext(cfg: SurovConfig, val id: Int,
 }
 
 class Pipeline(val cfg: SurovConfig) {
+  // base of the issue group
   val pcBase = Reg(UInt(cfg.xlen bits)) init(0) simPublic
-  // Initialize to a defined value to avoid X propagation when idle
-  val pc2 = Reg(UInt(cfg.xlen bits)) init(0) simPublic
+  val pc2 = Reg(UInt(cfg.xlen bits)).simPublic // jump target
   val irBuf = Vec.fill(cfg.issueWidth)(Reg(Bits(cfg.xlen bits))).simPublic
   irBuf(0).init(Opcode.Jal.asBits.resize(32) | 0x1000)
-  irBuf.drop(1).foreach(_.init(rv.nop))
-  val jumping = False  simPublic
-  val jumped = Reg(Bool).init(False)  simPublic
-  val ir2 = Reg(Bits(cfg.xlen * cfg.issueWidth bits)).assignDontCare.simPublic
-  val stage = Vec.fill(cfg.issueWidth)(Reg(Stage).init(Stage.S1))
-  val start = Vec.fill(cfg.issueWidth)(Reg(Bool).init(True))
-  val killAfter = B(False, cfg.issueWidth).simPublic
-  val kill  = killAfter.fillDownUntilLSO.simPublic
+  val jumping = False simPublic  // current cycle issued jump
+  val jumped = Reg(Bool).init(False) simPublic  // current group issued jump earlier
+  val ir2 = Reg(Bits(cfg.xlen * cfg.issueWidth bits)).simPublic
+  val stage = Vec.fill(cfg.issueWidth)(Reg(Stage).init(Stage.S1)) // multicycle stage
+  val start = Vec.fill(cfg.issueWidth)(Reg(Bool).init(True)) // 1st cycle of current stage
 
+  // ### Hazard detection logic ###
+
+  // - stage##Op variables indicate if each instruction does Op in the current stage
+  // - will##Op variables indicate if each instruction will do Op will do Op (exclusive of
+  // current stage for reads, inclusive otherwise).
+  // - Op##Scan variables indicate for each instruction if any predecessor will do Op
   val stageReads  = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
-  val stageWrites = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
   val willRead    = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
-  val willWrite   = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
-
   val readScan    = Vec(willRead.scanLeft(B(0, cfg.regCount bits))(_ | _)).simPublic
+
+  val stageWrites = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
+  val willWrite   = Vec.fill(cfg.issueWidth)(B(0, cfg.regCount bits)).simPublic
   val writeScan   = Vec(willWrite.scanLeft(B(0, cfg.regCount bits))(_ | _)).simPublic
 
+  // memory access hazards
   val stageMemX  = Vec.fill(cfg.issueWidth)(False).simPublic
   val willMemX   = Vec.fill(cfg.issueWidth)(False).simPublic
-
   val memScan  = Vec(willMemX.scanLeft(False)(_ | _)).simPublic
 
+  // overlap current stage operation with scan of all predecessors to check hazard
   def checkOverlap[T <: Data with BitwiseOp[T]](access: Vec[T], scan: Vec[T], reduce: T => Bool): Vec[Bool] = {
     Vec(access.zip(scan)
     .map({ case (a, b) => reduce(a & b) }))
   }
+  // drop first element because x0 is not hazard dependency
   val raw  = checkOverlap (stageReads,  writeScan, (b: Bits) => b.drop(1).orR).simPublic
   val war  = checkOverlap (stageWrites, readScan,  (b: Bits) => b.drop(1).orR).simPublic
   val waw  = checkOverlap (stageWrites, writeScan, (b: Bits) => b.drop(1).orR).simPublic
   val memDep = checkOverlap (stageMemX,  memScan,   (b: Bool) => b)
   
-  val stall = Vec.fill(cfg.issueWidth)(Bool).simPublic()
+  val occupied = Vec(stage.map(_ =/= Stage.S0))
+  val killAfter = B(False, cfg.issueWidth).simPublic // jumps and branches
+  val kill  = killAfter.fillDownUntilLSO.simPublic // successors of jumps/branches
+  val alive = occupied & ~kill.asBools
+  val stall = occupied & (raw | war | waw | memDep)
+  val active = alive & ~stall
+  // finished is set in build() after kill is computed
+  val finished = ~occupied
+  val retiring = Vec.fill(cfg.issueWidth)(False)  // set when instruction retires (finish + not killed)
+  stall.simPublic
+  active.simPublic
+  finished.simPublic
+
   val pipes: IndexedSeq[IExContext] =
     for (i <- 0 until cfg.issueWidth)
     yield new IExContext(cfg, i, pcBase + 4*i, irBuf(i), stage(i), start(i), stall(i), kill(i))
 
-  val occupied = Vec(pipes.map(_.stage =/= Stage.S0))
-  val alive = occupied & ~kill.asBools
-  stall := alive & (raw | war | waw | memDep)
-  val active = alive & ~stall
-  stall.simPublic
-  active.simPublic
-
-  // for convenience
-  val finished = Vec.fill(cfg.issueWidth)(False) simPublic
   val trap = False #* cfg.issueWidth
 
   val imem = new MemIF(cfg.xlen, cfg.xlen / 8 * cfg.issueWidth, false)
@@ -265,104 +275,120 @@ class Pipeline(val cfg: SurovConfig) {
   dmem.wren.foreach(_ := False)
 
   val fetchedJump = Reg(Bool) init(False) simPublic
+  val jumpPipeIdx = Reg(UInt(log2Up(cfg.issueWidth) bits)) simPublic
+  // Combinational view of jumpPipeIdx for same-cycle decisions (before register updates)
+  val jumpPipeIdxNow = UInt(log2Up(cfg.issueWidth) bits)
+  jumpPipeIdxNow := jumpPipeIdx  // default: use registered value
+
+  // Zicntr counters
+  val mcycle = Reg(UInt(64 bits)) init(0) simPublic
+  val minstret = Reg(UInt(64 bits)) init(0) simPublic;
+  mcycle := mcycle + 1
+  // instret incremented in build() after finished is computed
 
   def build(plugins: Seq[InstImpl]) {
     when (!fetchedJump) { imem.readReq(pcBase + 4*cfg.issueWidth) }
     for ((c, i) <- pipes.zipWithIndex) {
-      when (kill(i)) { _finish(i) }
-      when(stage(i) === Stage.S0) (finished(i) := True)
+      when (kill(i)) {
+        stage(i) := Stage.S0
+        finished(i) := True
+        // killed instructions don't retire (retiring stays False)
+      }
       switch(rv.opcode(c.ir)) {
         for (p <- plugins) {
           is(p.opcode) {
-            switch (c.stage) {
-              for (ss <- List(SoftStage.SoftS1, SoftStage.SoftS2, SoftStage.SoftS3)) {
+            switch (stage(i)) {
+              for (ss <- SoftStage.currentAndFollowing(SoftS1)) {
                 is(ss.harden) {
-                  p.getStage(c, ss)
-                  stageReads(i)  := p.getStageReads(c, ss)  & (occupied(i) #* cfg.regCount)
-                  stageWrites(i) := p.getStageWrites(c, ss) & (occupied(i) #* cfg.regCount)
-                  willRead(i)    := p.getWillRead(c, ss)    & (occupied(i) #* cfg.regCount)
-                  willWrite(i)   := p.getWillWrite(c, ss)   & (occupied(i) #* cfg.regCount)
-                  stageMemX(i)  := p.getStageMemX(ss) & occupied(i)
-                  willMemX(i)   := p.getWillMemX(ss)  & occupied(i)
+                  when(~c.stall & ~c.kill) {
+                    p.getStage(c, ss)
+                  }
+                  stageReads(i)  := p.getStageReads(c, ss)
+                  stageWrites(i) := p.getStageWrites(c, ss)
+                  willRead(i)    := p.getWillRead(c, ss)
+                  willWrite(i)   := p.getWillWrite(c, ss)
+                  stageMemX(i)   := p.getStageMemX(ss)
+                  willMemX(i)    := p.getWillMemX(ss)
                 }
               }
             }
             if (p.KillFollowing) {
-              when(c.stage =/= Stage.S0) (killAfter(i) set)
+              when(occupied(i)) (killAfter(i) := True)
             }
           }
-          default {}
         }
       }
     }
-    // if the last inst in the issue group is at S1, we didn't get to
+
+    // if the last inst in the issue group is at 1st cycle of S1, we didn't get to
     // fetch the next instructions yet.
-    when (finished.asBits.andR & pipes(cfg.issueWidth-1).stage =/= Stage.S1) {
+    val lastPipe = pipes(cfg.issueWidth-1)
+    when (finished.asBits.andR & lastPipe.stage =/= Stage.S1) {
       when(jumping | jumped) {
+        // jump / branch-taken. start from jump target (possibly in the middle of issue group)
         for (i <- 0 until cfg.issueWidth)
           irBuf(i) := imem.readData(i*cfg.xlen, cfg.xlen bits)
         pcBase := pc2.clearedLow(2 + log2Up(cfg.issueWidth))
-        val dead = (U(1) << pc2(2, log2Up(cfg.issueWidth) bits)) - 1
-        reset(~dead.asBits)
-      } elsewhen (kill.msb) {
+        val occupiedMask = if (cfg.issueWidth == 1) B"1"
+          else ~U(0, cfg.issueWidth bits) |<< pc2(2, log2Up(cfg.issueWidth) bits)
+        reset(occupiedMask.asBits)
+      } elsewhen (jumpPipeIdxNow.orR) {
         // a branch that was not taken and is not last in issue group.
         // Revive instructions after branch
-        reset(kill)
+        reset(~B(0, cfg.issueWidth bits) |<< jumpPipeIdxNow)
       } otherwise {
+        // non-branch/jump or branch not taken at end of group. whole next issue group will be occupied
         val irSrc = fetchedJump ? ir2 | imem.readData
         for (i <- 0 until cfg.issueWidth)
           irBuf(i) := irSrc(i*cfg.xlen, cfg.xlen bits)
         pcBase := pcBase + 4*cfg.issueWidth
         reset(~B(0, cfg.issueWidth bits))
       }
-      jumped := False
-      fetchedJump := False
     }
+
+    // Count retired instructions (finished and not killed)
+    minstret := minstret + cpop(retiring.asBits)
   }
 
   def nextStage(i: Int) {
-    when (~kill(i) & ~stall(i)) {
-      start(i) := True
-      switch(stage(i)) {
-        is(Stage.S1) { stage(i) := Stage.S2 }
-        is(Stage.S2) { stage(i) := Stage.S3 }
-      }
+    start(i) := True
+    switch(stage(i)) {
+      is(Stage.S1) { stage(i) := Stage.S2 }
+      is(Stage.S2) { stage(i) := Stage.S3 }
+      default { trap(i) := True}
     }
   }
 
-  def reset(mask: Bits) {
+  def reset(occupiedMask: Bits) {
+    jumped := False
+    fetchedJump := False
+    jumpPipeIdx := 0
     for (i <- 0 until cfg.issueWidth) {
-      stage(i) := mask(i) ? Stage.S1 | Stage.S0
+      stage(i) := occupiedMask(i) ? Stage.S1 | Stage.S0
       start(i) := True
     }
   }
 
-  def _finish(i: Int) {
+  def finish(i: Int) {
     stage(i) := Stage.S0
     finished(i) := True
-  }
-
-  def finishIfNotStalled(i: Int) {
-    when(~stall(i)) { _finish(i) }
+    retiring(i) := True
   }
 
   def fetch_jump(c: IExContext, target: UInt) = {
-    when (~kill(c.id)) {
-      pc2 := target
-      fetchedJump := True
-      when (~stall(c.id)) {
-        ir2 := imem.readData
-        imem.readReq(target)
-      }
-    }
+    pc2 := target
+    jumpPipeIdx := U(c.id + 1).resized
+    jumpPipeIdxNow := U(c.id + 1).resized  // same-cycle visibility
+    fetchedJump := True
+    ir2 := imem.readData
+    imem.readReq(target)
   }
 
   // has to happen on a later cycle than fetch_jump
-  // thus, doesn't need guarding with c.stall
   def take_jump(c: IExContext) {
     jumping := True
     jumped := True
-    finishIfNotStalled(c.id)
+    finish(c.id)
   }
 }
 
@@ -386,7 +412,7 @@ case class Surov3Core(cfg: SurovConfig) extends Component {
   pipeline.build(plugins)
 }
 
-case class Surov3Top(cfg: SurovConfig) extends Component {
+case class Surov3_RF_Top(cfg: SurovConfig) extends Component {
   val core = Surov3Core(cfg)
   val trap = out Bits(cfg.issueWidth bits)
   trap := core.trap
@@ -412,8 +438,9 @@ case class Surov3Top(cfg: SurovConfig) extends Component {
   }
 }
 
+// wrap it with memory for simulation
 case class SimDUT(cfg: SurovConfig) extends Component {
-  val top = Surov3Top(cfg)
+  val top = Surov3_RF_Top(cfg)
   val trap = out (Bits(cfg.issueWidth bits)).simPublic
   trap := top.trap
   val mem = Mem(Bits(cfg.xlen * cfg.issueWidth bits), wordCount = 1 << 14).simPublic
@@ -431,7 +458,7 @@ case class SimDUT(cfg: SurovConfig) extends Component {
 }
 
 object Surov3CoreVerilog extends App {
-  Config.spinal.generateVerilog(Surov3Top(SurovConfig()))
+  Config.spinal.generateVerilog(Surov3_RF_Top(SurovConfig()))
 }
 
 object Surov3CoreVhdl extends App {
