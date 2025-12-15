@@ -8,22 +8,41 @@ SuroV3 introduces a thin abstraction layer for the instruction definitions (Chec
 
 ## Current Status
 
-RV32I with Zicntr (cycle/instret counters). Runs Dhrystone benchmark.
+RV32I/RV32E with Zicntr (cycle/instret counters) and optional Zba extension. Runs Dhrystone benchmark.
 
-**Parameters**: `issueWidth` (1, 2, 4) and `enableDualPort` (single/dual register file ports)
+**Parameters**:
+- `issueWidth`: 1, 2, or 4
+- `enableDualPort`: single/dual register file ports
+- `syncRF`: synchronous or asynchronous RF reads
+- `enableZba`: Zba address generation extension
+- `regCount`: 32 (RV32I) or 16 (RV32E)
 
 ### Dhrystone Benchmark Results
 
-| Width | RF Ports | CPI | DMIPS/MHz |
-|-------|----------|-----|-----------|
-| 1 | Single | 2.485 | 0.528 |
-| 1 | Dual | 2.344 | 0.560 |
-| 2 | Single | 1.933 | 0.678 |
-| 2 | Dual | 1.813 | 0.723 |
-| 4 | Single | 1.655 | 0.793 |
-| 4 | Dual | 1.540 | 0.852 |
+| Config | CPI | DMIPS/MHz |
+|--------|-----|-----------|
+| w1_r32_sp_async | 2.477 | 0.542 |
+| w1_r32_sp_sync | 2.619 | 0.512 |
+| w1_r32_dp_async | 2.351 | 0.571 |
+| w1_r32_dp_sync | 2.494 | 0.538 |
+| w1_r32_sp_async+zba | 2.496 | 0.544 |
+| w1_r32_dp_async+zba | 2.369 | 0.573 |
+| w1_r32_dp_sync+zba | 2.513 | 0.540 |
+| w1_r16_sp_async | 2.476 | 0.515 |
+| w1_r16_sp_async+zba | 2.494 | 0.518 |
+| w1_r16_dp_async+zba | 2.373 | 0.545 |
+| w1_r16_sp_sync+zba | 2.646 | 0.488 |
+| w1_r16_dp_sync+zba | 2.524 | 0.512 |
+| w2_r32_sp_async+zba | 1.887 | 0.719 |
+| w2_r32_sp_sync+zba | 1.977 | 0.687 |
+| w2_r32_dp_async+zba | 1.770 | 0.767 |
+| w2_r32_dp_sync+zba | 1.861 | 0.730 |
+| w4_r32_dp_async+zba | 1.527 | 0.889 |
+| w4_r32_dp_sync+zba | 1.599 | 0.849 |
 
-*Note: Compiled with standard `-O3 -fno-inline` without tuning for issue width. Better ILP extraction expected with unrolling and scheduling optimizations.*
+Config naming: `w{issueWidth}_r{regCount}_{sp|dp}_{async|sync}[+zba]`
+
+*Note: Compiled with `-O3 -fno-inline`. Better ILP extraction expected with unrolling and scheduling optimizations.*
 
 ## Building and Simulation
 
@@ -38,14 +57,10 @@ RV32I with Zicntr (cycle/instret counters). Runs Dhrystone benchmark.
 
 ## 📝 TODO
 
-* Full, automated execution and reporting for all riscv-isa-tests, dhrystone coremark and embench.
+* Full, automated execution and reporting for all riscv-isa-tests, coremark and embench.
 
 * Enable RISCV Formal
 
 * Support Zmmul
 
 * Documentation of the pipeline stages and memory interface.
-
-* Addition of more parameterization options.
-
-* Support more extensions

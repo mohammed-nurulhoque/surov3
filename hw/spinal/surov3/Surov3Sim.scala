@@ -49,7 +49,22 @@ object Surov3CoreSim extends App {
   val SYS_WRITE = 64
   val maxCycles = 200000
   val baseAddr = 0x1000
-  val cfg = SurovConfig()
+
+  // Parse config from command-line args: --key=value
+  // e.g., --dualPort=true --syncRF=false --zba=true --regCount=32 --issueWidth=2
+  val argMap = args.filter(_.startsWith("--")).map { arg =>
+    val parts = arg.drop(2).split("=", 2)
+    parts(0) -> (if (parts.length > 1) parts(1) else "true")
+  }.toMap
+
+  val cfg = SurovConfig(
+    regCount = argMap.get("regCount").map(_.toInt).getOrElse(32),
+    enableDualPort = argMap.get("dualPort").map(_.toBoolean).getOrElse(false),
+    issueWidth = argMap.get("issueWidth").map(_.toInt).getOrElse(1),
+    syncRF = argMap.get("syncRF").map(_.toBoolean).getOrElse(false),
+    enableZba = argMap.get("zba").map(_.toBoolean).getOrElse(false),
+  )
+  println(s"Config: regCount=${cfg.regCount} dualPort=${cfg.enableDualPort} issueWidth=${cfg.issueWidth} syncRF=${cfg.syncRF} zba=${cfg.enableZba}")
 
   // Convert ELF to binary, returns path to bin
   def elf2bin(elf: String): String = {
@@ -60,7 +75,8 @@ object Surov3CoreSim extends App {
     bin
   }
 
-  val elfFiles = if (args.isEmpty) Array("hw/a.out") else args
+  val elfFiles = args.filterNot(_.startsWith("--"))
+  val elfFilesOrDefault = if (elfFiles.isEmpty) Array("hw/a.out") else elfFiles
 
   // Fallback opcode lookup using low 7 bits of the instruction.
   private val opcodeNames: Map[Int, String] = Map(
@@ -97,7 +113,7 @@ object Surov3CoreSim extends App {
       }
     }
 
-    for (elfPath <- elfFiles) {
+    for (elfPath <- elfFilesOrDefault) {
       val binPath = elf2bin(elfPath)
       val logPath = elfPath.replaceAll("\\.(elf|out)$", "") + ".log"
       val fw = new FileWriter(logPath, false)
@@ -218,7 +234,7 @@ object Surov3CoreSim extends App {
                   runDone = true
                   0
               }
-              if (!runDone) dut.top.rf.setBigInt(ir.toLong >> 7 & 0x1F, dataToWrite)
+              if (!runDone) dut.top.rf.setBigInt((ir.toLong >> 7).toInt & (cfg.regCount - 1), dataToWrite)
             }
             else if ((ir & 0x7F) == 0x0F) {
               // FENCE - no-op

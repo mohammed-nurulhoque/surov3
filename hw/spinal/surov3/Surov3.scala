@@ -7,26 +7,28 @@ import surov3.SoftStage.SoftS1
 
 case class SurovConfig(
   regCount: Int = 32,
-  enableDualPort: Boolean = true,
-  issueWidth: Int = 2,
+  enableDualPort: Boolean = false,
+  issueWidth: Int = 1,
   enableForward: Boolean = false,
   xlen: Int = 32,
+  syncRF: Boolean = true,  // true = sync read (1 cycle latency), false = async read (combinational)
+  enableZba: Boolean = false,  // Zba address generation extension (sh1add, sh2add, sh3add)
 )
 
 /** Unified synchronous port interface for register file and memory access.
-  * @param dataWidth   Width of data bus in bits
-  * @param addrWidth   Width of address bus in bits
-  * @param writable    Whether write operations are supported
-  * @param wordBytes   If Some(n), enables byte-address shifting and alignment logic for n-byte words
-  * @param xlen        Target data width for sign extension (used when wordBytes is set)
-  * @param hasReady    Whether to include ready signal (for memory handshake)
+  * @param dataWidth    Width of data bus in bits
+  * @param addrWidth    Width of address bus in bits
+  * @param writable     Whether write operations are supported
+  * @param isByteAddress If true, addresses are byte addresses (shifted for word access)
+  * @param extendWidth  Target width for sign extension in readRsp (typically xlen)
+  * @param hasReady     Whether to include ready signal (for memory handshake)
   */
 class PortIF(
   val dataWidth: Int,
   val addrWidth: Int,
   val writable: Boolean = true,
-  val wordBytes: Option[Int] = None,
-  val xlen: Int = 32,
+  val isByteAddress: Boolean = false,
+  val extendWidth: Int = 32,
   val hasReady: Boolean = false,
 ) extends Bundle {
   val addr = out UInt(addrWidth bits)
@@ -35,18 +37,23 @@ class PortIF(
   val wren = Option.when(writable)(out Bool())
   val writeData = Option.when(writable)(out Bits(dataWidth bits))
   val ready = Option.when(hasReady)(in Bool)
-  val wmask = Option.when(writable && wordBytes.isDefined)(out Bits(wordBytes.get bits))
 
-  private def addrShift = wordBytes.map(log2Up(_)).getOrElse(0)
+  private def wordBytes = dataWidth / 8
+  private def addrShift = if (isByteAddress) log2Up(wordBytes) else 0
+  val wmask = Option.when(writable && isByteAddress)(out Bits(wordBytes bits))
 
-  /** Issue sync read request. Call in stage N, response available in stage N+1. */
-  def readReq(address: UInt): Unit = {
+  /** Issue read request and return read data.
+    * For sync RF: returns data from previous cycle's request (current return value is stale).
+    * For async RF: returns data for current address (valid same cycle).
+    */
+  def readReq(address: UInt): Bits = {
     addr := (if (addrShift > 0) address.drop(addrShift).asUInt else address)
     valid := True
     wren.foreach(_ := False)
+    readData
   }
 
-  /** Simple read response - returns raw data. */
+  /** Get read response (alias for readData). */
   def readRsp(): Bits = readData
 
   /** Read response with RISC-V load alignment and sign extension.
@@ -54,15 +61,14 @@ class PortIF(
     * @param funct3   RISC-V funct3 for load width/sign
     */
   def readRsp(address: UInt, funct3: Bits): Bits = {
-    val wb = wordBytes.getOrElse(dataWidth / 8)
-    val byteOffset   = address(0, log2Up(wb) bits)
+    val byteOffset   = address(0, log2Up(wordBytes) bits)
     val bitOffset    = byteOffset << 3
     val shiftedData  = readData |>> bitOffset
     val logbyteCount = funct3.dropHigh(1).asUInt
-    val byteCount    = U(1, log2Up(wb).max(3) bits) |<< logbyteCount
+    val byteCount    = U(1, log2Up(wordBytes).max(3) bits) |<< logbyteCount
 
     // Build contiguous bitmask for requested byte/half/word
-    val bitmask = ~(~B(0, wb * 8 bits) |<< (byteCount << 3))
+    val bitmask = ~(~B(0, dataWidth bits) |<< (byteCount << 3))
 
     // Pick sign bit for requested width
     val msb = Bool
@@ -74,50 +80,49 @@ class PortIF(
     }
 
     val signBit = funct3.msb ? False | msb // unsigned loads zero-extend
-    (shiftedData & bitmask | (~bitmask).andMask(signBit)).resize(xlen bits)
+    (shiftedData & bitmask | (~bitmask).andMask(signBit)).resize(extendWidth bits)
   }
 
   /** Write operation.
-    * @param address    Address to write (byte address if wordBytes is set)
+    * @param address    Address to write
     * @param data       Data to write
-    * @param funct3     If Some, applies RISC-V store alignment and byte mask
+    * @param funct3     If Some and isByteAddress, applies RISC-V store alignment and byte mask
     * @param guardZero  If true, prevents writes to address 0 (for x0 register)
     */
   def write(address: UInt, data: Bits, funct3: Option[Bits] = None, guardZero: Boolean = false): Unit = {
     assert(writable, "write to non-writable port interface")
     valid := True
 
-    (funct3, wordBytes) match {
-      case (Some(f3), Some(wb)) =>
-        // RISC-V Store: alignment and byte mask
-        val byteOffset   = address(0, log2Up(wb) bits)
-        val bitOffset    = byteOffset << 3
-        val logbyteCount = f3.dropHigh(1).asUInt
-        val byteCount    = U(1, log2Up(wb) + 1 bits) |<< logbyteCount
-        addr          := address.drop(log2Up(wb)).asUInt
-        wren.get      := True
-        writeData.get := (data << bitOffset).resize(dataWidth bits)
-        wmask.foreach(_ := (~(~B(0, wb bits) |<< byteCount)) |<< byteOffset)
-
-      case _ =>
-        // Simple write (register file style)
-        addr := address
-        wren.get := (if (guardZero) address.orR else True)
-        writeData.get := data
+    if (funct3.isDefined && isByteAddress) {
+      // RISC-V Store: alignment and byte mask
+      val f3 = funct3.get
+      val byteOffset   = address(0, log2Up(wordBytes) bits)
+      val bitOffset    = byteOffset << 3
+      val logbyteCount = f3.dropHigh(1).asUInt
+      val byteCount    = U(1, log2Up(wordBytes) + 1 bits) |<< logbyteCount
+      addr          := address.drop(log2Up(wordBytes)).asUInt
+      wren.get      := True
+      writeData.get := (data << bitOffset).resize(dataWidth bits)
+      wmask.foreach(_ := (~(~B(0, wordBytes bits) |<< byteCount)) |<< byteOffset)
+    } else {
+      // Simple write (register file style)
+      addr := address
+      wren.get := (if (guardZero) address.orR else True)
+      writeData.get := data
     }
   }
 }
 
-// Type aliases for clarity
+// Factory methods for common port configurations
 object PortIF {
   /** Create a register file port */
   def rf(xlen: Int, regCount: Int, writable: Boolean = true) =
     new PortIF(xlen, log2Up(regCount), writable)
 
-  /** Create a memory port */
+  /** Create a memory port with byte addressing */
   def mem(xlen: Int, wordBytes: Int, writable: Boolean) =
     new PortIF(wordBytes * 8, xlen - log2Up(wordBytes), writable,
-      wordBytes = Some(wordBytes), xlen = xlen, hasReady = true)
+      isByteAddress = true, extendWidth = xlen, hasReady = true)
 }
 
 class ALU(xlen: Int, regCount: Int) extends BlackBox {  
@@ -208,7 +213,7 @@ class IExContext(cfg: SurovConfig, val id: Int,
     alu.src_b  := b
     alu.f3 := rv.funct3(ir)
     alu.arith_bit := rv.arith(ir)
-    alu.shadd := rv.shadd(ir)
+    alu.shadd := (if (cfg.enableZba) rv.shadd(ir) else False)
     alu.branch := rv.opcode(ir) === Opcode.Branch
     alu.start   := start
     (alu.result, alu.shamt_out)
@@ -429,26 +434,40 @@ case class Surov3_RF_Top(cfg: SurovConfig) extends Component {
   val dmemIF = PortIF.mem(cfg.xlen, cfg.xlen/8, writable = true)
   core.pipeline.imem <> imemIF
   core.pipeline.dmem <> dmemIF
-  val rf = Mem(Bits(32 bits), wordCount = cfg.regCount).simPublic
+  val rf = Mem(Bits(cfg.xlen bits), wordCount = cfg.regCount).simPublic
   
   // One-shot init: write 0 to x0 on first cycle after reset
   val initX0 = RegNext(False).init(True)
   when(initX0) { rf.write(address = 0, data = B(0, cfg.xlen bits)) }
   
   for (c <- core.pipeline.pipes) {
-    // Synchronous read/write port for rf1 (x0 initialized above, write guard in PortIF.write)
-    c.rf1.readData := rf.readWriteSync(
-      address = c.rf1.addr,
-      data = c.rf1.writeData.get,
-      enable = c.rf1.valid,
-      write = c.rf1.wren.get
-    )
-    if (cfg.enableDualPort) {
-      // Synchronous read-only port for rf2
-      c.rf2.get.readData := rf.readSync(
-        address = c.rf2.get.addr,
-        enable = c.rf2.get.valid
+    if (cfg.syncRF) {
+      // Synchronous read/write port for rf1 (x0 initialized above, write guard in PortIF.write)
+      c.rf1.readData := rf.readWriteSync(
+        address = c.rf1.addr,
+        data = c.rf1.writeData.get,
+        enable = c.rf1.valid,
+        write = c.rf1.wren.get
       )
+      if (cfg.enableDualPort) {
+        // Synchronous read-only port for rf2
+        c.rf2.get.readData := rf.readSync(
+          address = c.rf2.get.addr,
+          enable = c.rf2.get.valid
+        )
+      }
+    } else {
+      // Async read, separate write for rf1
+      c.rf1.readData := rf.readAsync(c.rf1.addr)
+      rf.write(
+        address = c.rf1.addr,
+        data = c.rf1.writeData.get,
+        enable = c.rf1.wren.get
+      )
+      if (cfg.enableDualPort) {
+        // Async read-only port for rf2
+        c.rf2.get.readData := rf.readAsync(c.rf2.get.addr)
+      }
     }
   }
 }
