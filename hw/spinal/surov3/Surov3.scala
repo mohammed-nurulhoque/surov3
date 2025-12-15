@@ -7,110 +7,117 @@ import surov3.SoftStage.SoftS1
 
 case class SurovConfig(
   regCount: Int = 32,
-  enableDualPort: Boolean = false,
-  issueWidth: Int = 8,
+  enableDualPort: Boolean = true,
+  issueWidth: Int = 2,
   enableForward: Boolean = false,
   xlen: Int = 32,
 )
 
-class RFIF(xlen: Int, regCount: Int) extends Bundle {
-  val addr = out UInt(log2Up(regCount) bits) assignDontCare
-  val wren = out (False)
-  val writeData = out Bits(xlen bits) assignDontCare
-  val readData = in Bits(xlen bits)
+/** Unified synchronous port interface for register file and memory access.
+  * @param dataWidth   Width of data bus in bits
+  * @param addrWidth   Width of address bus in bits
+  * @param writable    Whether write operations are supported
+  * @param wordBytes   If Some(n), enables byte-address shifting and alignment logic for n-byte words
+  * @param xlen        Target data width for sign extension (used when wordBytes is set)
+  * @param hasReady    Whether to include ready signal (for memory handshake)
+  */
+class PortIF(
+  val dataWidth: Int,
+  val addrWidth: Int,
+  val writable: Boolean = true,
+  val wordBytes: Option[Int] = None,
+  val xlen: Int = 32,
+  val hasReady: Boolean = false,
+) extends Bundle {
+  val addr = out UInt(addrWidth bits)
+  val valid = out Bool()
+  val readData = in Bits(dataWidth bits)
+  val wren = Option.when(writable)(out Bool())
+  val writeData = Option.when(writable)(out Bits(dataWidth bits))
+  val ready = Option.when(hasReady)(in Bool)
+  val wmask = Option.when(writable && wordBytes.isDefined)(out Bits(wordBytes.get bits))
 
-  /** Async read */
-  def read(regnum: UInt) = {
-    addr := regnum
-    readData
-  }
-  
-  def write(c: IExContext, regnum: UInt, value: Bits) {
-    addr := regnum
-    wren := True
-    writeData := value
-  }
-}
+  private def addrShift = wordBytes.map(log2Up(_)).getOrElse(0)
 
-class MemIF(val xlen: Int, val wordBytes: Int, val writable: Boolean) extends Bundle {
-  val addr = out UInt(xlen-log2Up(wordBytes) bits) assignDontCare
-  val readData = in Bits(wordBytes*8 bits)
-  val valid = out Bool
-  val ready = in Bool
-  val wren      = Option.when(writable)(out (Bool))
-  val wmask     = Option.when(writable)(out Bits(wordBytes bits) assignDontCare)
-  val writeData = Option.when(writable)(out Bits(wordBytes*8 bits) assignDontCare)
-
-  /**
-    * PHASE 1: Read Request
-    * Call this in the Execute stage to drive the memory bus.
-    * @param address The full byte-address (e.g., 32 bits). 
-    * The lower bits are dropped for the bus index.
-    */
+  /** Issue sync read request. Call in stage N, response available in stage N+1. */
   def readReq(address: UInt): Unit = {
-    // Drop lower log2Up(wordBytes) bits to convert Byte Address -> Word Index
-    // For wordBytes=16 (4 words), this drops 4 bits
-    addr  := address.drop(log2Up(wordBytes)).asUInt
+    addr := (if (addrShift > 0) address.drop(addrShift).asUInt else address)
     valid := True
     wren.foreach(_ := False)
   }
 
-/**
-    * PHASE 2: Read Response (after readReq in a prior cycle)
-    * @param address The full byte-address used in the Request phase (needed for alignment).
-    * @param funct3  Optional RISC-V encoding. If None, returns raw aligned data.
+  /** Simple read response - returns raw data. */
+  def readRsp(): Bits = readData
+
+  /** Read response with RISC-V load alignment and sign extension.
+    * @param address  Original byte address (for alignment calculation)
+    * @param funct3   RISC-V funct3 for load width/sign
     */
-  def readRsp(address: UInt, funct3: Option[Bits] = None): Bits = {
-    funct3 match {
-      case None => 
-        // instruction load: Return data directly from bus
-        readData
+  def readRsp(address: UInt, funct3: Bits): Bits = {
+    val wb = wordBytes.getOrElse(dataWidth / 8)
+    val byteOffset   = address(0, log2Up(wb) bits)
+    val bitOffset    = byteOffset << 3
+    val shiftedData  = readData |>> bitOffset
+    val logbyteCount = funct3.dropHigh(1).asUInt
+    val byteCount    = U(1, log2Up(wb).max(3) bits) |<< logbyteCount
 
-      case Some(f3) =>
-        // RISC-V Load : Handle alignment and extension
-        val byteOffset   = address(0, log2Up(wordBytes) bits)
+    // Build contiguous bitmask for requested byte/half/word
+    val bitmask = ~(~B(0, wb * 8 bits) |<< (byteCount << 3))
+
+    // Pick sign bit for requested width
+    val msb = Bool
+    switch(logbyteCount) {
+      is(U(0, 2 bits)) { msb := shiftedData(7) }
+      is(U(1, 2 bits)) { msb := shiftedData(15) }
+      is(U(2, 2 bits)) { msb := shiftedData(31) }
+      default          { msb.assignDontCare() }
+    }
+
+    val signBit = funct3.msb ? False | msb // unsigned loads zero-extend
+    (shiftedData & bitmask | (~bitmask).andMask(signBit)).resize(xlen bits)
+  }
+
+  /** Write operation.
+    * @param address    Address to write (byte address if wordBytes is set)
+    * @param data       Data to write
+    * @param funct3     If Some, applies RISC-V store alignment and byte mask
+    * @param guardZero  If true, prevents writes to address 0 (for x0 register)
+    */
+  def write(address: UInt, data: Bits, funct3: Option[Bits] = None, guardZero: Boolean = false): Unit = {
+    assert(writable, "write to non-writable port interface")
+    valid := True
+
+    (funct3, wordBytes) match {
+      case (Some(f3), Some(wb)) =>
+        // RISC-V Store: alignment and byte mask
+        val byteOffset   = address(0, log2Up(wb) bits)
         val bitOffset    = byteOffset << 3
-        val shiftedData  = readData |>> bitOffset
         val logbyteCount = f3.dropHigh(1).asUInt
-        // +1 bit to avoid overflow (e.g., 1 << 2 = 4 needs 3 bits)
-        val byteCount    = U(1, log2Up(wordBytes).max(3) bits) |<< logbyteCount
+        val byteCount    = U(1, log2Up(wb) + 1 bits) |<< logbyteCount
+        addr          := address.drop(log2Up(wb)).asUInt
+        wren.get      := True
+        writeData.get := (data << bitOffset).resize(dataWidth bits)
+        wmask.foreach(_ := (~(~B(0, wb bits) |<< byteCount)) |<< byteOffset)
 
-        // Build a contiguous bitmask (little-endian) for the requested byte/half/word
-        val bitmask = ~(~B(0, wordBytes * 8 bits) |<< (byteCount << 3))
-
-        // Pick the sign bit for the requested width
-        val msb = Bool
-        switch(logbyteCount) {
-          is(U(0, 2 bits)) { msb := shiftedData(7) }
-          is(U(1, 2 bits)) { msb := shiftedData(15) }
-          is(U(2, 2 bits)) { msb := shiftedData(31) }
-          default          { msb.assignDontCare() }
-        }
-
-        val signBit = f3.msb ? False | msb // unsigned loads zero-extend
-        (shiftedData & bitmask | (~bitmask).andMask(signBit)).resize(xlen bits)
+      case _ =>
+        // Simple write (register file style)
+        addr := address
+        wren.get := (if (guardZero) address.orR else True)
+        writeData.get := data
     }
   }
+}
 
-  /**
-    * Write Operation (Atomic Request)
-    * @param address Full byte-address.
-    * @param data    Data to write (Right aligned / from Register File).
-    * @param funct3  Optional RISC-V encoding. If None, writes full word.
-    */
-  def write(address: UInt, data: Bits, funct3:Bits): Unit = {
-    assert(writable, "write to unwritable memory interface") 
-    val byteOffset  = address(0, log2Up(wordBytes) bits)
-    val bitOffset   = byteOffset << 3
-    val logbyteCount= funct3.dropHigh(1).asUInt
-    // +1 bit to avoid overflow (e.g., 1 << 2 = 4 needs 3 bits)
-    val byteCount   = U(1, log2Up(wordBytes) + 1 bits) |<< logbyteCount
-    valid          := True
-    wren.get       := True
-    addr           := address.drop(log2Up(wordBytes)).asUInt
-    writeData.get  := (data << bitOffset).resize(wordBytes * 8 bits)
-    wmask.get      := (~(~B(0, wordBytes bits) |<< byteCount)) |<< byteOffset
-  }
+// Type aliases for clarity
+object PortIF {
+  /** Create a register file port */
+  def rf(xlen: Int, regCount: Int, writable: Boolean = true) =
+    new PortIF(xlen, log2Up(regCount), writable)
+
+  /** Create a memory port */
+  def mem(xlen: Int, wordBytes: Int, writable: Boolean) =
+    new PortIF(wordBytes * 8, xlen - log2Up(wordBytes), writable,
+      wordBytes = Some(wordBytes), xlen = xlen, hasReady = true)
 }
 
 class ALU(xlen: Int, regCount: Int) extends BlackBox {  
@@ -177,8 +184,10 @@ class IExContext(cfg: SurovConfig, val id: Int,
   val r2 = Reg(UInt(cfg.xlen bits)).simPublic()
   val alu = new ALU(cfg.xlen, cfg.regCount)
 
-  val rf1 = new RFIF(cfg.xlen, cfg.regCount)
-  val rf2 = Option.when(cfg.enableDualPort)(new RFIF(cfg.xlen, cfg.regCount))
+  val rf1 = PortIF.rf(cfg.xlen, cfg.regCount, writable = true)
+  rf1.addr.assignDontCare(); rf1.valid := False; rf1.wren.get := False; rf1.writeData.get.assignDontCare()
+  val rf2 = Option.when(cfg.enableDualPort)(PortIF.rf(cfg.xlen, cfg.regCount, writable = false))
+  rf2.foreach { r => r.addr.assignDontCare(); r.valid := False }
   alu.f3 := rv.F3_ADDSUB
   List(alu.src_a, alu.src_b, alu.start) map (_.assignDontCare)
   List(alu.arith_bit, alu.shadd, alu.branch) map (_ := False)
@@ -267,12 +276,12 @@ class Pipeline(val cfg: SurovConfig) {
 
   val trap = False #* cfg.issueWidth
 
-  val imem = new MemIF(cfg.xlen, cfg.xlen / 8 * cfg.issueWidth, false)
-  val dmem = new MemIF(cfg.xlen, cfg.xlen / 8 * cfg.issueWidth, true)
-  // Default: no memory access unless write/readReq sets it
-  imem.valid := False
-  dmem.valid := False
-  dmem.wren.foreach(_ := False)
+  val imem = PortIF.mem(cfg.xlen, cfg.xlen / 8 * cfg.issueWidth, writable = false)
+  val dmem = PortIF.mem(cfg.xlen, cfg.xlen / 8, writable = true)
+  // Initialize at instantiation to avoid overlapping assignments when exported across SoC layers
+  imem.addr.assignDontCare(); imem.valid := False
+  dmem.addr.assignDontCare(); dmem.valid := False
+  dmem.wren.get := False; dmem.writeData.get.assignDontCare(); dmem.wmask.get.assignDontCare()
 
   val fetchedJump = Reg(Bool) init(False) simPublic
   val jumpPipeIdx = Reg(UInt(log2Up(cfg.issueWidth) bits)) simPublic
@@ -416,24 +425,30 @@ case class Surov3_RF_Top(cfg: SurovConfig) extends Component {
   val core = Surov3Core(cfg)
   val trap = out Bits(cfg.issueWidth bits)
   trap := core.trap
-  val imemIF = new MemIF(cfg.xlen, cfg.xlen/8 * cfg.issueWidth, false)
-  val dmemIF = new MemIF(cfg.xlen, cfg.xlen/8 * cfg.issueWidth, true)
+  val imemIF = PortIF.mem(cfg.xlen, cfg.xlen/8 * cfg.issueWidth, writable = false)
+  val dmemIF = PortIF.mem(cfg.xlen, cfg.xlen/8, writable = true)
   core.pipeline.imem <> imemIF
   core.pipeline.dmem <> dmemIF
-  val rf = Mem(Bits(32 bits), wordCount = cfg.regCount) simPublic;
+  val rf = Mem(Bits(32 bits), wordCount = cfg.regCount).simPublic
+  
+  // One-shot init: write 0 to x0 on first cycle after reset
+  val initX0 = RegNext(False).init(True)
+  when(initX0) { rf.write(address = 0, data = B(0, cfg.xlen bits)) }
+  
   for (c <- core.pipeline.pipes) {
-    // Asynchronous read so dependent ops see latest reg value without an extra cycle
-    c.rf1.readData := c.rf1.addr.mux(
-      U(0, log2Up(cfg.regCount) bits) -> B(0, cfg.xlen bits),
-      default -> rf.readAsync(c.rf1.addr)
+    // Synchronous read/write port for rf1 (x0 initialized above, write guard in PortIF.write)
+    c.rf1.readData := rf.readWriteSync(
+      address = c.rf1.addr,
+      data = c.rf1.writeData.get,
+      enable = c.rf1.valid,
+      write = c.rf1.wren.get
     )
-    rf.write(c.rf1.addr, c.rf1.writeData, c.rf1.wren)
     if (cfg.enableDualPort) {
-      c.rf2.get.readData := c.rf2.get.addr.mux(
-        U(0, log2Up(cfg.regCount) bits) -> B(0, cfg.xlen bits),
-        default -> rf.readAsync(c.rf2.get.addr)
+      // Synchronous read-only port for rf2
+      c.rf2.get.readData := rf.readSync(
+        address = c.rf2.get.addr,
+        enable = c.rf2.get.valid
       )
-      // rf.write(c.rf2.get.addr, c.rf2.get.writeData, c.rf2.get.wren)
     }
   }
 }
@@ -448,13 +463,29 @@ case class SimDUT(cfg: SurovConfig) extends Component {
     address = top.imemIF.addr.resize(14),
     enable = top.imemIF.valid,
   )
-  top.dmemIF.readData := mem.readWriteSync(
-    address = top.dmemIF.addr.resize(14),
+
+  // dmem is xlen-wide, but memory is (xlen * issueWidth)-wide
+  // Map the narrow dmem access to the correct lane in the wide memory word
+  val laneBits = log2Up(cfg.issueWidth)
+  val dmemWideAddr = top.dmemIF.addr.dropLow(laneBits).resize(14).asUInt
+  val dmemLane = top.dmemIF.addr.takeLow(laneBits).asUInt
+  // Register lane for read response alignment (readWriteSync has 1-cycle latency)
+  val dmemLaneReg = RegNextWhen(dmemLane, top.dmemIF.valid)
+
+  // Shift narrow data/mask into the correct lane for writes
+  val dmemWideData = (top.dmemIF.writeData.get.resize(cfg.xlen * cfg.issueWidth) |<< (dmemLane * cfg.xlen))
+  val dmemWideMask = (top.dmemIF.wmask.get.resize(cfg.xlen / 8 * cfg.issueWidth) |<< (dmemLane * (cfg.xlen / 8)))
+
+  val dmemWideReadData = mem.readWriteSync(
+    address = dmemWideAddr,
     enable = top.dmemIF.valid,
     write = top.dmemIF.wren.get,
-    data = top.dmemIF.writeData.get,
-    mask = top.dmemIF.wmask.get
+    data = dmemWideData,
+    mask = dmemWideMask
   )
+
+  // Extract the correct lane from the wide read data (use registered lane)
+  top.dmemIF.readData := (dmemWideReadData |>> (dmemLaneReg * cfg.xlen)).resize(cfg.xlen)
 }
 
 object Surov3CoreVerilog extends App {

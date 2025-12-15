@@ -12,7 +12,7 @@ abstract class InstImpl(p: Pipeline) {
 
   // --- Default Stage Access Definitions ---
 
-  // Default read: Most instructions read rs1 in S1.
+  // Default read: Most instructions issue read request for rs1 in S1.
   def getReadsS1(c: IExContext): Bits = B(1) << rv.rs1(c.ir)
 
   // Default read: No reads in S2 or S3.
@@ -61,25 +61,29 @@ abstract class InstImpl(p: Pipeline) {
     }
   }
 
+  /** S1: Issue sync read request for rs1. Response available in S2 via readRsp(). */
   def getS1(c: IExContext) = {
-    c.r1 := c.rf1.read(rv.rs1(c.ir)).asUInt
+    c.rf1.readReq(rv.rs1(c.ir))
     p.nextStage(c.id)
   }
+  
   def getS2(c: IExContext) {}
   def getS3(c: IExContext) {}
 }
 
 class OpOpImpl(p: Pipeline) extends InstImpl(p) {
   override def opcode = Opcode.Op
+  // S1: issue read request for rs1 (and rs2 if dual port)
   override def getReadsS1(c: IExContext) =
     if (p.cfg.enableDualPort)
       (B(1) << rv.rs1(c.ir)) | (B(1) << rv.rs2(c.ir))
     else
       B(1) << rv.rs1(c.ir)
-      
+  // S2: issue read request for rs2 (single port only)
   override def getReadsS2(c: IExContext): Bits =
     if (p.cfg.enableDualPort) 0
     else B(1) << rv.rs2(c.ir)
+  // Write happens in S2 for dual port, S3 for single port
   override def getWritesS2(c: IExContext): Bits =
     if (p.cfg.enableDualPort) B(1) << rv.rd(c.ir)
     else 0
@@ -88,29 +92,39 @@ class OpOpImpl(p: Pipeline) extends InstImpl(p) {
     else B(1) << rv.rd(c.ir)
   
   override def getS1(c: IExContext): Unit = {
-    super[InstImpl].getS1(c)
+    c.rf1.readReq(rv.rs1(c.ir))
     if (p.cfg.enableDualPort)
-      c.r2 := c.rf2.get.read(rv.rs2(c.ir)).asUInt
+      c.rf2.get.readReq(rv.rs2(c.ir))
+    p.nextStage(c.id)
   }
 
-  override def getS2(c: IExContext) {
+  override def getS2(c: IExContext): Unit = {
     if (p.cfg.enableDualPort) {
-      getExe(c)
+      // Both values on readRsp, execute immediately
+      getExe(c, c.rf1.readRsp().asUInt, c.rf2.get.readRsp().asUInt)
     } else {
-      c.r2 := c.rf1.read(rv.rs2(c.ir)).asUInt
+      // Save rs1 before issuing rs2 request (overwrites readRsp)
+      c.r1 := c.rf1.readRsp().asUInt
+      c.rf1.readReq(rv.rs2(c.ir))
       p.nextStage(c.id)
     }
   }
-  override def getS3(c: IExContext) {
-    if (!p.cfg.enableDualPort) getExe(c)
+
+  override def getS3(c: IExContext): Unit = {
+    if (!p.cfg.enableDualPort) {
+      getExe(c, c.r1, c.rf1.readRsp().asUInt)
+    }
   }
 
-  def getExe(c: IExContext) {
-    val (res, shamt_rem) = c.compute(c.r1, c.r2)
+  /** Execute ALU operation. r1Init/r2Init are initial operands; uses c.r1/c.r2 on cycle 2+ for multi-cycle ops */
+  def getExe(c: IExContext, r1Init: UInt, r2Init: UInt): Unit = {
+    val r1Val = c.start ? r1Init | c.r1
+    val r2Val = c.start ? r2Init | c.r2
+    val (res, shamt_rem) = c.compute(r1Val, r2Val)
     c.r1 := res
     c.r2 := shamt_rem.resize(c.r2.getWidth)
     when(c.alu.ready) {
-      c.rf1.write(c, rv.rd(c.ir), c.alu.result.asBits) // FIXME
+      c.rf1.write(rv.rd(c.ir), c.alu.result.asBits, guardZero = true)
       p.finish(c.id)
     }
   }
@@ -120,12 +134,16 @@ class OpImmImpl(p: Pipeline) extends InstImpl(p) {
   override def opcode = Opcode.OpImm
 
   override def getWritesS2(c: IExContext): Bits = B(1) << rv.rd(c.ir)
-  override def getS2(c: IExContext) {
-    val (res, shamt_rem) = c.compute(c.r1, c.start ? rv.imm_i(c.ir).asUInt | c.r2)
+  
+  // S2: readRsp() has rs1 (persists since no other read), compute with immediate
+  override def getS2(c: IExContext): Unit = {
+    val r1Val = c.start ? c.rf1.readRsp().asUInt | c.r1
+    val r2Val = c.start ? rv.imm_i(c.ir).asUInt | c.r2
+    val (res, shamt_rem) = c.compute(r1Val, r2Val)
     c.r1 := res
     c.r2 := shamt_rem.resize(c.r2.getWidth)
     when(c.alu.ready) {
-      c.rf1.write(c, rv.rd(c.ir), c.alu.result.asBits) // FIXME
+      c.rf1.write(rv.rd(c.ir), c.alu.result.asBits, guardZero = true)
       p.finish(c.id)
     }
   }
@@ -136,7 +154,7 @@ class AuipcImpl(p: Pipeline) extends InstImpl(p) {
   override def getReadsS1(c: IExContext) = 0
   override def getWritesS1(c: IExContext): Bits = B(1) << rv.rd(c.ir)
   override def getS1(c: IExContext) {
-    c.rf1.write(c, rv.rd(c.ir), c.add(c.pc, rv.imm_u(c.ir).asUInt).asBits)
+    c.rf1.write(rv.rd(c.ir), c.add(c.pc, rv.imm_u(c.ir).asUInt).asBits, guardZero = true)
     p.finish(c.id)
   }
 }
@@ -146,7 +164,7 @@ class LuiImpl(p: Pipeline) extends InstImpl(p) {
   override def getReadsS1(c: IExContext) = 0
   override def getWritesS1(c: IExContext): Bits = B(1) << rv.rd(c.ir)
   override def getS1(c: IExContext) {
-    c.rf1.write(c, rv.rd(c.ir), rv.imm_u(c.ir).asBits)
+    c.rf1.write(rv.rd(c.ir), rv.imm_u(c.ir).asBits, guardZero = true)
     p.finish(c.id)
   }
 }
@@ -156,39 +174,54 @@ class LoadImpl(p: Pipeline) extends InstImpl(p) {
   override def getWritesS3(c: IExContext): Bits = B(1) << rv.rd(c.ir)
   override def getStageMemX(ss: SoftStage): Bool = Bool(ss == SoftS2)
   override def getWillMemX(ss: SoftStage): Bool = True
-  override def getS2(c: IExContext) = {
-    val address = c.add(c.r1, rv.imm_i(c.ir).asUInt)
-    c.r1 := address
+  
+  // S2: readRsp() has rs1 (persists), compute address, issue memory read
+  override def getS2(c: IExContext): Unit = {
+    val address = c.add(c.rf1.readRsp().asUInt, rv.imm_i(c.ir).asUInt)
+    c.r1 := address  // Store address for S3 readRsp alignment
     p.dmem.readReq(address)
     p.nextStage(c.id)
   }
-  override def getS3(c: IExContext) = {
-    c.rf1.write(c, rv.rd(c.ir), p.dmem.readRsp(c.r1, Some(rv.funct3(c.ir))))
+  
+  override def getS3(c: IExContext): Unit = {
+    c.rf1.write(rv.rd(c.ir), p.dmem.readRsp(c.r1, rv.funct3(c.ir)), guardZero = true)
     p.finish(c.id)
   }
 }
 
 class StoreImpl(p: Pipeline) extends InstImpl(p) {
   override def opcode: Opcode.C = Opcode.Store
+  // S2: issue read request for rs2
   override def getReadsS2(c: IExContext) = B(1) << rv.rs2(c.ir)
-  override def getStageMemX(ss: SoftStage): Bool = Bool(ss == SoftS2)
+  // Memory access happens in S3
+  override def getStageMemX(ss: SoftStage): Bool = Bool(ss == SoftS3)
   override def getWillMemX(ss: SoftStage): Bool = True
+  
+  // S2: Save rs1 (address base), issue read for rs2
   override def getS2(c: IExContext): Unit = {
+    c.r1 := c.rf1.readRsp().asUInt  // Save before rs2 request overwrites readRsp
+    c.rf1.readReq(rv.rs2(c.ir))
+    p.nextStage(c.id)
+  }
+  
+  // S3: readRsp() has rs2 (store data), write to memory
+  override def getS3(c: IExContext): Unit = {
     p.dmem.write(
       c.add(c.r1, rv.imm_s(c.ir).asUInt),
-      c.rf1.read(rv.rs2(c.ir)),
-      rv.funct3(c.ir)
+      c.rf1.readRsp(),
+      Some(rv.funct3(c.ir))
     )
     p.finish(c.id)
   }
 }
-class JalImpl(p: Pipeline) extends  InstImpl(p) {
+
+class JalImpl(p: Pipeline) extends InstImpl(p) {
   override def opcode: Opcode.C = Opcode.Jal
   override def getReadsS1(c: IExContext) = 0
   override def getWritesS1(c: IExContext): Bits = B(1) << rv.rd(c.ir)
   override val KillFollowing = true
   override def getS1(c: IExContext): Unit = {
-    c.rf1.write(c, rv.rd(c.ir), c.pc + 4 asBits)
+    c.rf1.write(rv.rd(c.ir), (c.pc + 4).asBits, guardZero = true)
     p.fetch_jump(c, c.add(c.pc, rv.imm_j(c.ir).asUInt))
     p.nextStage(c.id)
   }
@@ -200,16 +233,17 @@ class JalImpl(p: Pipeline) extends  InstImpl(p) {
 class JalrImpl(p: Pipeline) extends InstImpl(p) {
   override def opcode: Opcode.C = Opcode.Jalr
   override val KillFollowing = true
-  override def getWritesS2(c: IExContext): Bits = B(1) << rv.rd(c.ir)
+  override def getWritesS3(c: IExContext): Bits = B(1) << rv.rd(c.ir)
 
+  // S2: readRsp() has rs1 (persists), compute jump target
   override def getS2(c: IExContext): Unit = {
-    p.fetch_jump(c, c.add(c.r1, rv.imm_i(c.ir).asUInt))
+    p.fetch_jump(c, c.add(c.rf1.readRsp().asUInt, rv.imm_i(c.ir).asUInt))
     p.nextStage(c.id)
   }
-  override def getS3(c: IExContext) = {
-    c.rf1.write(c, rv.rd(c.ir), c.pc + 4 asBits)
+  
+  override def getS3(c: IExContext): Unit = {
+    c.rf1.write(rv.rd(c.ir), (c.pc + 4).asBits, guardZero = true)
     p.take_jump(c)
-
   }
 }
 
@@ -237,7 +271,7 @@ class SysImpl(p: Pipeline) extends InstImpl(p) {
         is(U(rv.CSR_INSTRET, 12 bits))                          { csrVal := p.minstret(31 downto 0) }
         is(U(rv.CSR_INSTRETH, 12 bits))                         { csrVal := p.minstret(63 downto 32) }
       }
-      c.rf1.write(c, rv.rd(c.ir), csrVal.asBits)
+      c.rf1.write(rv.rd(c.ir), csrVal.asBits, guardZero = true)
       p.finish(c.id)
     } otherwise {
       // ECALL/EBREAK - trap to simulation
@@ -249,50 +283,64 @@ class SysImpl(p: Pipeline) extends InstImpl(p) {
 
 class FenceImpl(p: Pipeline) extends InstImpl(p) {
   override def opcode: Opcode.C = Opcode.Fence
-  override def getS2(c: IExContext): Unit = p.finish(c.id)
+  override def getReadsS1(c: IExContext) = 0
+  override def getS1(c: IExContext): Unit = p.finish(c.id)
 }
 
 class BranchImpl(p: Pipeline) extends InstImpl(p) {
   override def opcode: Opcode.C = Opcode.Branch
+  // S1: issue read request for rs1 (and rs2 if dual port)
   override def getReadsS1(c: IExContext) =
     if (p.cfg.enableDualPort)
       (B(1) << rv.rs1(c.ir)) | (B(1) << rv.rs2(c.ir))
     else
       B(1) << rv.rs1(c.ir)
 
+  // S2: issue read request for rs2 (single port only)
   override def getReadsS2(c: IExContext): Bits =
     if (p.cfg.enableDualPort) 0
     else B(1) << rv.rs2(c.ir)
   override val KillFollowing = true
 
   override def getS1(c: IExContext): Unit = {
-    super[InstImpl].getS1(c)
+    c.rf1.readReq(rv.rs1(c.ir))
     if (p.cfg.enableDualPort) {
-      c.r2 := c.rf2.get.read(rv.rs2(c.ir)).asUInt
-      // FIXME. InstImpls are not supposed to access pc2 directly
+      c.rf2.get.readReq(rv.rs2(c.ir))
+      // Pre-compute branch target (pc+imm doesn't need register values)
+      // so ALU is free for compare in S2
       p.pc2 := c.add(c.pc, rv.imm_b(c.ir).asUInt)
     }
+    p.nextStage(c.id)
   }
 
   override def getS2(c: IExContext): Unit = {
     if (p.cfg.enableDualPort) {
-    // has to do the pc+imm add in S1 because add and compute use the same alu
-      p.fetch_jump(c, p.pc2)
-      when(!c.compute(c.r1, c.r2)._1(0)) {
-        p.finish(c.id)
-      } otherwise p.nextStage(c.id)
+      // Both values on readRsp
+      val r1Val = c.rf1.readRsp().asUInt
+      val r2Val = c.rf2.get.readRsp().asUInt
+      p.fetch_jump(c, p.pc2)  // Use pre-computed target
+      // Early branch resolution
+      when(!c.compute(r1Val, r2Val)._1(0)) {
+        p.finish(c.id)  // Branch not taken
+      } otherwise {
+        p.nextStage(c.id)  // Branch taken, go to S3
+      }
     } else {
+      // Save rs1 before rs2 request overwrites readRsp
+      c.r1 := c.rf1.readRsp().asUInt
+      c.rf1.readReq(rv.rs2(c.ir))
       p.fetch_jump(c, c.add(c.pc, rv.imm_b(c.ir).asUInt))
-      c.r2 := c.rf1.read(rv.rs2(c.ir)).asUInt
       p.nextStage(c.id)
     }
   }
 
-  override def getS3(c: IExContext) = {
+  override def getS3(c: IExContext): Unit = {
     if (p.cfg.enableDualPort) {
+      // Only reached if branch taken
       p.take_jump(c)
     } else {
-      when(c.compute(c.r1, c.r2)._1(0)) {
+      // readRsp() has rs2
+      when(c.compute(c.r1, c.rf1.readRsp().asUInt)._1(0)) {
         p.take_jump(c)
       } otherwise {
         p.finish(c.id)
