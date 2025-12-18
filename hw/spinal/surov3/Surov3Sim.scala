@@ -146,7 +146,9 @@ object Surov3CoreSim extends App {
       breakable {
         while (cycles < maxCycles && !runDone) {
           val trapBits = dut.trap.toLong
+          println(s"willRead: ${pl.willRead.map(_.toLong)}") // This fails
           val pipesSnap = pl.pipes.map { c =>
+            println(s"op: ${c.op.toEnum}")  // This also fails
             PipeSnap(
               id = c.id,
               opcode = opcodeName(c.ir.toLong),
